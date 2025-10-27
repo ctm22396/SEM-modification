@@ -1,0 +1,440 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-01-27"
+---
+
+```{r}
+elements <- read_rds("all_groups_elements.rds")
+covers_matrix <- read_rds("all_groups_covers_matrix.rds")
+```
+
+```{r}
+library(parallel)
+library(doParallel)
+#setup parallel backend to use many processors
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+res <- clusterEvalQ(cl, library(tidyverse))
+res <- clusterEvalQ(cl, library(pcalg))
+
+tol <- sqrt(.Machine$double.eps)
+```
+
+
+```{r}
+# elements <- as.list(structural_relations)# [c(1:2, 7:8, 10:14)]
+# elements <- clusters_full
+# elements <- all_groups
+max_order <- length(elements)
+
+covers_matrix <- diag(length(elements)) > 0
+for (ord in seq_len(max_order)) {
+  cat("Order:", ord, "\n")
+  
+  incomp_matrix <- !(covers_matrix | t(covers_matrix))
+
+  # Parallel iteration
+  output <- foreach(i = seq_len(ncol(incomp_matrix))) %dopar% {
+    incomps <- which(incomp_matrix[i, ])
+    n_incomps <- length(incomps)
+  
+    # If not enough incomparables to fill subset, go to next.
+    if (n_incomps < ord) {
+      # returning is equivalent to next in dopar
+      # next()
+      return(covers_matrix)
+    }
+    
+    # Start looping through until no more subsets
+    subset_gen <- list(nextSet = seq_len(ord), wasLast = FALSE)
+    while (!subset_gen$wasLast) {
+      subset_dex <- subset_gen$nextSet
+      incomp_subset <- incomps[subset_dex]
+      
+      # Check if minimum diagonal is less than tolerance, implying the tested
+      # subset conditionally covers element i.
+      diag_value <- conditional_partial_diag(i, incomp_subset, elements, mat)
+      if (diag_value < tol) {
+        covers_matrix[i, incomp_subset] <- TRUE
+      }
+      
+      # Choose next subset of incomps of size 'ord'
+      subset_gen <- getNextSet(n_incomps, ord, subset_dex)
+    }
+    
+    return(covers_matrix)
+  }
+  
+  # Combining the results of the parallel processes
+  covers_matrix <- reduce(c(list(covers_matrix), output), `|`)
+  
+  # Merge elements if they are mutually nulling
+  # eq_classes_resolved <- resolve_eq_classes(covers_matrix, elements)
+  # elements <- eq_classes_resolved$elements
+  # covers_matrix <- eq_classes_resolved$covers_matrix
+}
+```
+
+
+# TODO
+- have to traverse the powerset of (S / {x}) for each x in S.
+- kill a branch at the point it nulls x, so x nulled by {u, v, w} means there
+  will be no checking if x is nulled by {u, v, w, y}.
+- kill a branch if the span of a subset contains the span of a subset that nulls x.
+- maybe I need to build this tree first
+
+
+```{r}
+
+```
+
+
+
+```{r}
+library(RcppAlgos)
+# elements <- clusters_full
+elements <- all_groups
+max_order <- length(elements)
+max_combos_per_chunk <- 10000
+max_combos_before_kill <- 1e6
+n_cores <- length(cl)
+
+covers_matrix <- diag(length(elements)) > 0
+for (ord in seq_len(max_order)) {
+  changed <- TRUE
+  step <- 1
+  while (changed) {
+    # le_matrix <- transitive_closure(covers_matrix)
+    # incomp_matrix <- !(le_matrix | t(le_matrix))
+    new_covers_matrix <- covers_matrix
+    incomp_matrix <- !(covers_matrix | t(covers_matrix))
+    
+    max_incomps <- max(rowSums(incomp_matrix))
+    max_combos <- choose(max_incomps, ord)
+    if (max_combos > max_combos_before_kill) {
+      print("Exiting because too many combinations to consider.")
+      break
+    }
+    
+    cat("Order: ", ord, ", Step: ", step,
+        ", N Elements: ", length(elements),
+        ", Max Combos: ", max_combos,
+        "\n", sep = "")
+  
+    # Parallel iteration
+    for (i in seq_len(ncol(incomp_matrix))) {
+      incomps <- which(incomp_matrix[i, ])
+      n_incomps <- length(incomps)
+    
+      # If not enough incomparables to fill subset, go to next.
+      if (n_incomps < ord) {
+        next()
+      }
+      
+      # Start looping through until no more subsets
+      n_combos <- choose(n_incomps, ord)
+      n_chunks <- ceiling(n_combos / max_combos_per_chunk / n_cores)
+      breaks <- round(seq(0, n_combos, length.out = n_chunks + 1))
+      lowers <- breaks[-(n_chunks + 1)] + 1
+      uppers <- breaks[-1]
+      for (n in seq_len(n_chunks)) {
+        chunk_combinations <- comboGeneral(n_incomps, ord, 
+                                           lower = lowers[n],
+                                           upper = uppers[n])
+        
+        n_parts <- min(n_cores, nrow(chunk_combinations))
+        part_breaks <- round(seq(0, nrow(chunk_combinations), length.out = n_parts + 1))
+        lower_part <- part_breaks[-(n_parts + 1)] + 1
+        upper_part <- part_breaks[-1]
+        output <- foreach(m = seq_len(n_parts)) %dopar% {
+          combinations <- chunk_combinations[lower_part[m]:upper_part[m], , drop = FALSE]
+          for (j in seq_len(nrow(combinations))) {
+            subset_dex <- combinations[j, ]
+            incomp_subset <- incomps[subset_dex]
+            
+            # Check if minimum diagonal is less than tolerance, implying the tested
+            # subset conditionally covers element i.
+            diag_value <- conditional_partial_diag(i, incomp_subset, elements, mat)
+            if (diag_value < tol) {
+              covers_matrix[i, incomp_subset] <- TRUE
+            }
+          }
+          
+          return(covers_matrix)
+        }
+        # Combining the results of the parallel processes
+        new_covers_matrix <- reduce(c(list(new_covers_matrix), output), `|`)
+      }
+    }
+    
+    diff_matrix <- new_covers_matrix & !(covers_matrix)
+    
+    # Combine elements if they are mutually nulling
+    eq_classes_resolved <- resolve_eq_classes(new_covers_matrix, covers_matrix, elements)
+    elements <- eq_classes_resolved$elements
+    covers_matrix <- eq_classes_resolved$covers_matrix
+    changed <- nrow(covers_matrix) != nrow(new_covers_matrix)
+    
+    step <- step + 1
+  }
+}
+```
+
+# Candidates not incomps
+
+TODO:
+- try to get a list of the conditioning sets discovered at last order before nonnull
+- then you could manually go through and try to drop some one of those sets (if multiple) until you get a DAG
+
+```{r}
+# elements <- clusters_full
+# elements <- as.list(structural_relations)
+# elements <- all_groups
+max_order <- length(elements)
+tol2 <- tol
+
+last_candidates <- list()
+covers_matrix <- diag(length(elements)) > 0
+for (ord in seq_len(max_order)) {
+  cat("Order:", ord, "\n")
+  
+  le_matrix <- transitive_closure(covers_matrix)
+  candidate_matrix <- !le_matrix
+  
+  min_diag_candidates <- apply(candidate_matrix, 1, \(x) unlist(elements[x]), simplify = FALSE) %>%
+    map2(elements, ., partial_mat, mat = mat) %>%
+    map(diag) %>%
+    map_dbl(min)
+  
+  null_indices <- which(min_diag_candidates < tol2)
+  null_indices <- seq_along(min_diag_candidates)
+
+  # Parallel iteration
+  output <- foreach(i = null_indices) %dopar% {
+    candidates <- which(candidate_matrix[i, ])
+    n_candidates <- length(candidates)
+  
+    # If not enough candidates for nonzero binom coeff, go to next.
+    if (n_candidates < ord) {
+      # returning is equivalent to next in dopar
+      # next()
+      return(covers_matrix)
+    }
+    
+    # Start looping through until no more subsets
+    nulling_candidates <- list()
+    subset_gen <- list(nextSet = seq_len(ord), wasLast = FALSE)
+    while (!subset_gen$wasLast) {
+      subset_dex <- subset_gen$nextSet
+      candidate_subset <- candidates[subset_dex]
+      
+      # Check if minimum diagonal is less than tolerance, implying the tested
+      # subset conditionally covers element i.
+      diag_value <- conditional_partial_diag(i, candidate_subset, elements, mat)
+      if (diag_value < tol2) {
+        nulling_candidates <- c(nulling_candidates, list(candidate_subset))
+      }
+      
+      # Choose next subset of candidates of size 'ord'
+      subset_gen <- getNextSet(n_candidates, ord, subset_dex)
+    }
+    
+    # Pick the smallest subset if nonnulling
+    complements_diag <- map(nulling_candidates, setdiff, x = candidates) %>%
+      map_dbl(conditional_partial_diag, x = i, elements, mat)
+    nonnulling_complements <- which(complements_diag > tol2)
+     
+    # if (length(nonnulling_complements) > 0) {
+    #   nonnull_complement_candidates <- nulling_candidates[nonnulling_complements]
+    #   smallest_candidate_dex <- map(nonnull_complement_candidates, \(x) unlist(elements)) %>%
+    #     map_dbl(length) %>%
+    #     which.min()
+    #   smallest_candidate <- nonnull_complement_candidates[[smallest_candidate_dex]]
+    #   
+    #   covers_matrix[i, smallest_candidate] <- TRUE
+    #   
+    #   return(covers_matrix)
+    # }
+    
+    
+    for (candidate_subset in nulling_candidates) {
+      covers_matrix[i, candidate_subset] <- TRUE
+    }
+    
+    return(covers_matrix)
+  }
+  
+  # Combining the results of the parallel processes
+  covers_matrix <- reduce(c(list(covers_matrix), output), `|`)
+}
+
+# Merge elements if they are mutually nulling and share the same covers
+# eq_classes_resolved <- resolve_eq_classes(covers_matrix, elements)
+# elements <- eq_classes_resolved$elements
+# covers_matrix <- eq_classes_resolved$covers_matrix
+```
+
+```{r}
+library(RcppAlgos)
+# elements <- clusters_full
+elements <- all_groups
+max_order <- length(elements)
+max_combos_per_chunk <- 10000
+max_combos_before_kill <- 1e6
+n_cores <- length(cl)
+tol2 <- 0.2
+
+covers_matrix <- diag(length(elements)) > 0
+for (ord in seq_len(max_order)) {
+  cat("Order: ", ord, ", N Elements: ", length(elements), "\n", sep = "")
+  
+  candidate_matrix <- !covers_matrix
+  
+  min_diag_candidates <- apply(candidate_matrix, 1, \(x) unlist(elements[x]), simplify = FALSE) %>%
+    map2(elements, ., partial_mat, mat = mat) %>%
+    map(diag) %>%
+    map_dbl(min)
+  
+  null_indices <- which(min_diag_candidates < tol2)
+  
+  max_candidates <- max(rowSums(candidate_matrix))
+  if (choose(max_candidates, ord) > max_combos_before_kill) {
+    print("Exiting because too many combinations to consider.")
+    break
+  }
+
+  # Parallel iteration
+  for (i in null_indices) {
+    candidates <- which(candidate_matrix[i, ])
+    n_candidates <- length(candidates)
+  
+    # If not enough candidates to fill subset, go to next.
+    if (n_candidates < ord) {
+      next()
+    }
+    
+    # Start looping through until no more subsets
+    n_combos <- choose(n_candidates, ord)
+    n_chunks <- ceiling(n_combos / max_combos_per_chunk / n_cores)
+    breaks <- round(seq(0, n_combos, length.out = n_chunks + 1))
+    lowers <- breaks[-(n_chunks + 1)] + 1
+    uppers <- breaks[-1]
+    for (n in seq_len(n_chunks)) {
+      chunk_combinations <- comboGeneral(n_candidates, ord, 
+                                         lower = lowers[n],
+                                         upper = uppers[n])
+      
+      n_parts <- min(n_cores, nrow(chunk_combinations))
+      part_breaks <- round(seq(0, nrow(chunk_combinations), length.out = n_parts + 1))
+      lower_part <- part_breaks[-(n_parts + 1)] + 1
+      upper_part <- part_breaks[-1]
+      output <- foreach(m = seq_len(n_parts)) %dopar% {
+        combinations <- chunk_combinations[lower_part[m]:upper_part[m], , drop = FALSE]
+        for (j in seq_len(nrow(combinations))) {
+          subset_dex <- combinations[j, ]
+          candidate_subset <- candidates[subset_dex]
+          
+          # Check if minimum diagonal is less than tolerance, implying the tested
+          # subset conditionally covers element i.
+          diag_value <- conditional_partial_diag(i, candidate_subset, elements, mat)
+          if (diag_value < tol2) {
+            covers_matrix[i, candidate_subset] <- TRUE
+          }
+        }
+        
+        return(covers_matrix)
+      }
+      # Combining the results of the parallel processes
+      covers_matrix <- reduce(c(list(covers_matrix), output), `|`)
+    }
+  }
+  
+  # Merge elements if they are mutually nulling
+  eq_classes_resolved <- resolve_eq_classes(covers_matrix, elements)
+  elements <- eq_classes_resolved$elements
+  covers_matrix <- eq_classes_resolved$covers_matrix
+}
+```
+
+# Plots
+
+## Covers Matrix
+
+```{r}
+library(igraph)
+library(relations)
+lt_matrix <- covers_matrix & t(!covers_matrix) # gets rid of mutual covers
+m <- lt_matrix; colnames(m) <- rownames(m) <- map_chr(elements, first)
+g <- graph_from_adjacency_matrix(m, mode = "directed", diag = TRUE)
+df <- get.data.frame(g)
+r <- endorelation(
+  domain = lapply(unique(unlist(df[c("from", "to")])), sets::as.set),
+  graph = df[c("from", "to")]
+)
+rmat <- relation_incidence(transitive_reduction(r))
+mattr <- m * rmat[rownames(m), colnames(m)]
+gtr <- graph_from_adjacency_matrix(mattr, mode = "directed", diag = FALSE)
+
+plot(gtr, layout = layout_with_sugiyama, edge.arrow.size = 0.5)
+```
+
+
+### Transposed
+
+```{r}
+lt_matrix <- covers_matrix # & t(!covers_matrix) # gets rid of mutual covers
+m <- t(lt_matrix); colnames(m) <- rownames(m) <- map_chr(elements, first)
+g <- graph_from_adjacency_matrix(m, mode = "directed", diag = TRUE)
+df <- get.data.frame(g)
+r <- endorelation(
+  domain = lapply(unique(unlist(df[c("from", "to")])), sets::as.set),
+  graph = df[c("from", "to")]
+)
+rmat <- relation_incidence(transitive_reduction(r))
+mattr <- m * rmat[rownames(m), colnames(m)]
+gtr <- graph_from_adjacency_matrix(mattr, mode = "directed", diag = FALSE)
+
+plot(g, layout = layout_with_sugiyama, edge.arrow.size = 0.5)
+```
+
+
+## Transitive Closure
+
+```{r}
+le_matrix <- transitive_closure(covers_matrix)
+lt_matrix <- le_matrix & t(!le_matrix) # gets rid of mutual covers
+m <- lt_matrix; colnames(m) <- rownames(m) <- map_chr(elements, first)
+g <- graph_from_adjacency_matrix(m, mode = "directed", diag = TRUE)
+df <- get.data.frame(g)
+r <- endorelation(
+  domain = lapply(unique(unlist(df[c("from", "to")])), sets::as.set),
+  graph = df[c("from", "to")]
+)
+rmat <- relation_incidence(transitive_reduction(r))
+mattr <- m * rmat[rownames(m), colnames(m)]
+gtr <- graph_from_adjacency_matrix(mattr, mode = "directed", diag = FALSE)
+
+plot(gtr, layout = layout_with_sugiyama, edge.arrow.size = 0.5)
+```
+
+
+### Transposed
+
+```{r}
+le_matrix <- transitive_closure(covers_matrix)
+lt_matrix <- le_matrix & t(!le_matrix) # gets rid of mutual covers
+m <- t(lt_matrix); colnames(m) <- rownames(m) <- map_chr(elements, first)
+g <- graph_from_adjacency_matrix(m, mode = "directed", diag = TRUE)
+df <- get.data.frame(g)
+r <- endorelation(
+  domain = lapply(unique(unlist(df[c("from", "to")])), sets::as.set),
+  graph = df[c("from", "to")]
+)
+rmat <- relation_incidence(transitive_reduction(r))
+mattr <- m * rmat[rownames(m), colnames(m)]
+gtr <- graph_from_adjacency_matrix(mattr, mode = "directed", diag = FALSE)
+
+plot(gtr, layout = layout_with_sugiyama, edge.arrow.size = 0.5)
+```

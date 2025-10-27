@@ -1,0 +1,1736 @@
+---
+title: "Untitled"
+output: html_document
+date: '2022-12-03'
+---
+
+```{r}
+library(lavaan)
+library(tidyverse)
+source("./extract/helpers.R")
+source("./extract/extract_matrices.R")
+source("./extract/extract_bases_correlations.R")
+source("./pseudo_frobenius_clustering.R")
+source("./regularized_rotation.R")
+```
+
+
+```{r}
+lvShip_pop <- read_model("./model_syntax/lvsem_shipley_misspec_true.txt")
+pop_fit <- sem(lvShip_pop)
+
+pop_mats <- extract_matrices(pop_fit) %>%
+  map_if(~ is.list(.x), first)
+```
+
+
+```{r}
+plot_correlations_clustered <- function(mat, clusters) {
+  nclusts <- length(clusters)
+  total <- length(unlist(clusters))
+  clust_sizes <- map_dbl(clusters, length)
+  divisions <- c(0, cumsum(clust_sizes)) + 0.5
+  
+  horiz_data <- tibble(
+    xstart = rep(divisions[-(nclusts + 1)], each = 2),
+    xend = rep(divisions[-1], each = 2),
+    ystart = total - c(divisions[1], rep(divisions[-c(1, nclusts + 1)], each = 2), divisions[(nclusts + 1)]) + 1,
+    yend = total - c(divisions[1], rep(divisions[-c(1, nclusts + 1)], each = 2), divisions[(nclusts + 1)]) + 1
+  )
+  
+  vert_data <- tibble(
+    xstart = c(divisions[1], rep(divisions[-c(1, nclusts + 1)], each = 2), divisions[(nclusts + 1)]),
+    xend = c(divisions[1], rep(divisions[-c(1, nclusts + 1)], each = 2), divisions[(nclusts + 1)]),
+    ystart = total - rep(divisions[-(nclusts + 1)], each = 2) + 1,
+    yend = total - rep(divisions[-1], each = 2) + 1
+  )
+  seg_data <- rbind(horiz_data, vert_data)
+  
+  plot_correlations(mat[unlist(clusters), unlist(clusters)], sort = FALSE) +
+    geom_segment(mapping = aes(x = xstart, xend = xend, y = ystart, yend = yend), size = 1, inherit.aes = FALSE, data = seg_data) +
+    geom_hline(yintercept = total - divisions + 1, size = 1, linetype = "dashed") +
+    geom_vline(xintercept = divisions, size = 1, linetype = "dashed") +
+    theme(axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          axis.text = element_text(size = 10))
+}
+```
+
+
+
+```{r}
+true_fit <- sem(read_model("./model_syntax/lvsem_shipley_true.txt"))
+true_fit@SampleStats@cov <- lavInspect(true_fit, "implied")
+out <- semPlot::semPaths(true_fit, layout = "tree2",
+                         whatLabels = "omit", edge.label.cex = 0.8,
+                         style = "lisrel")
+```
+
+
+```{r}
+pop_cov <- fitted(pop_fit)$cov
+N <- 300
+samp_cov <- N/(N - 1)*pop_cov
+
+samp_data <- rerun(ncol(pop_cov), rnorm(N)) %>%
+  set_names(colnames(fitted(pop_fit)$cov)) %>%
+  do.call(what = cbind) %>%
+  {. %*% solve(chol(cov(.))) %*% chol(samp_cov)}
+```
+
+
+```{r}
+lvShip_model <- read_model("./model_syntax/lvsem_shipley_misspec_true.txt")
+samp_fit <- sem(lvShip_model, samp_data)
+```
+
+
+
+```{r}
+misspecs <- c("Epsilon~Alpha", "Delta~Beta", "Gamma=~d1", "Delta=~c1")
+redherring <- "Gamma~~Delta"
+others <- c("Gamma=~d2", "Gamma=~d3", "Delta=~c2", "Delta=~c3",
+            "c1~~d1", "c2~~d2", "c3~~d3",
+            "Delta~Alpha", "Alpha~~Delta", "Delta~Beta", "Beta~~Delta")
+targets <- c(misspecs, redherring)
+other_targets <- c(misspecs[-(1:2)], others)
+```
+
+
+```{r}
+samp_mats <- extract_info(samp_fit)
+
+free <- samp_mats$names$free
+W <- samp_mats$W
+full_info <- samp_mats$info$full
+
+info <- samp_mats$info$ortho
+jac <- samp_mats$jac
+```
+
+
+```{r}
+mis <- c(15, 11)
+res_cov <- sqrt(mis / N * diag(info)[misspecs[1:2]])
+betas <- solve(info[misspecs[1:2], misspecs[1:2]]) %*% res_cov
+misspec_res <- jac[, misspecs[1:2]] %*% betas
+
+check <- crossprod(misspec_res, W) %*% jac %*% MASS::ginv(full_info[colnames(jac), colnames(jac)]) %*% info[colnames(jac), misspecs[1:2]]
+check - res_cov
+```
+
+```{r}
+info_ortho <- info - info[, misspecs[1:2]] %*% 
+  solve(info[misspecs[1:2], misspecs[1:2]]) %*% 
+  info[misspecs[1:2], ]
+
+mis_ortho <- c(8, 8, 7) * 2
+res_cov_ortho <- sqrt(mis_ortho / N * diag(info_ortho)[targets[-(1:2)]])
+betas_ortho <- MASS::ginv(info_ortho[other_targets, other_targets]) %*% 
+  info_ortho[other_targets, targets[-(1:2)]] %*% 
+  solve(info_ortho[targets[-(1:2)], targets[-(1:2)]]) %*%
+  res_cov_ortho
+rownames(betas_ortho) <- other_targets
+ortho_res <- jac %*% MASS::ginv(full_info[colnames(jac), colnames(jac)]) %*% info_ortho[colnames(jac), other_targets] %*% betas_ortho
+
+check <- crossprod(betas_ortho, info_ortho[other_targets, targets[-(1:2)]])
+check - res_cov_ortho
+```
+
+
+```{r}
+info_error <- full_info[-1, -1] - full_info[-1, c(free, targets, others)] %*%
+  MASS::ginv(full_info[c(free, targets, others), c(free, targets, others)]) %*%
+  full_info[c(free, targets, others), -1]
+```
+
+
+```{r}
+cov_error <- MASS::ginv(info_error * N) + 0*info_error
+betas_error <- mvtnorm::rmvnorm(n = 1, sigma = cov_error)[1, ]
+error_res <- jac %*% MASS::ginv(full_info[colnames(jac), colnames(jac)]) %*% info_error[colnames(jac), ] %*% betas_error
+total_res <- error_res + misspec_res + ortho_res
+```
+
+
+```{r}
+check <- crossprod(total_res, W) %*% jac %*% MASS::ginv(full_info[colnames(jac), colnames(jac)]) %*% info[colnames(jac), targets[1:2]]
+check2 <- crossprod(total_res, W) %*% jac %*% MASS::ginv(full_info[colnames(jac), colnames(jac)]) %*% info_ortho[colnames(jac), targets[-(1:2)]]
+c(check, check2) - c(res_cov, res_cov_ortho)
+```
+
+
+```{r}
+samp_cov_error <- samp_cov + lav_matrix_vech_reverse(total_res)
+
+samp_data_error <- rerun(ncol(samp_cov_error), rnorm(N)) %>%
+  set_names(colnames(samp_cov_error)) %>%
+  do.call(what = cbind) %>%
+  {. %*% solve(chol(cov(.))) %*% chol(samp_cov_error)}
+
+
+lvShip_model <- read_model("./model_syntax/lvsem_shipley_model.txt")
+samp_fit <- sem(lvShip_model, samp_data_error)
+samp_fit
+```
+
+
+```{r}
+modindices(samp_fit, sort = TRUE) %>%
+  select(lhs, op, rhs, mi) %>%
+  mutate(p.value = pchisq(mi, df = 1, lower.tail = FALSE)) %>%
+  filter(p.value <= 0.1) %>%
+  mutate(p.value = formatC(p.value, 3, format = "f"),
+         p.value = ifelse(p.value == "0.000", "<0.001", p.value))
+  
+```
+
+
+# Writing
+
+
+## Pruning
+
+### Writing
+
+# Clustering
+
+
+```{r}
+samp_mats <- extract_info(samp_fit)
+samp_info <- samp_mats$info$full[-1, -1]
+samp_lvcov <- samp_mats$info$ortho[-1, -1]
+samp_free <- samp_mats$names$free
+samp_fixed <- samp_mats$names$fixed
+```
+
+
+```{r}
+con_select <- c(
+  str_subset(samp_fixed, "(Gamma|Delta)=~(c|d)\\d"),
+  str_subset(samp_fixed, "(c|d)(\\d)~~(c|d)\\2"),
+  # str_subset(samp_fixed, "(c|d)\\d~~(c|d)\\d"),
+  # str_subset(samp_fixed, "a\\d~~a\\d"),
+  # str_subset(samp_fixed, "b\\d~~b\\d"),
+  # str_subset(samp_fixed, "c\\d~~c\\d"),
+  # str_subset(samp_fixed, "d\\d~~d\\d"),
+  # str_subset(samp_fixed, "e\\d~~e\\d"),
+  str_subset(samp_fixed, "b(\\d)~~e\\1"),
+  str_subset(samp_fixed, "(Gamma|Delta)~Alpha"),
+  str_subset(samp_fixed, "Alpha~~(Gamma|Delta)"),
+  str_subset(samp_fixed, "(Gamma|Delta)~~Epsilon"),
+  str_subset(samp_fixed, "Delta~Beta"),
+  str_subset(samp_fixed, "Beta~~Gamma"),
+  str_subset(samp_fixed, "Beta~~Delta"),
+  str_subset(samp_fixed, "Gamma~Delta"),
+  str_subset(samp_fixed, "Delta~Gamma"),
+  str_subset(samp_fixed, "Gamma~~Delta"),
+  str_subset(samp_fixed, "Epsilon~(Alpha|Beta)"),
+  str_subset(samp_fixed, "(Alpha|Beta|Gamma|Delta)~~Epsilon")
+) %>% unique()
+
+```
+
+
+```{r}
+samp_ortho_std <- samp_mats$std_info$ortho
+samp_o_mask <- !is.na(diag(samp_ortho_std))
+orig_samp_ortho_std <- cov2cor(samp_ortho_std[samp_o_mask, samp_o_mask])
+samp_ortho_std <- cov2cor(samp_ortho_std[samp_o_mask, samp_o_mask])
+```
+
+
+```{r}
+renames <- str_replace_all(colnames(samp_ortho_std), "~~", "↔") %>%
+  str_replace_all("=~", "_") %>%
+  str_replace_all("(.*)~(.*)", "\\2→\\1")
+dimnames(samp_ortho_std) <- rerun(2, renames)
+
+samp_select <- str_replace_all(con_select, "~~", "↔") %>%
+  str_replace_all("=~", "_") %>%
+  str_replace_all("(.*)~(.*)", "\\2→\\1") %>%
+  intersect(renames)
+
+samp_targets <- str_replace_all(c(targets, "Delta~Alpha"), "~~", "↔") %>%
+  str_replace_all("=~", "_") %>%
+  str_replace_all("(.*)~(.*)", "\\2→\\1") %>%
+  intersect(renames)
+```
+
+# -- run above here --
+
+## AHHHH
+**CONSIDER DIFFERENT MISFIT STRUCTURE BC THE FACTOR MISSPECS ARE SO MUCH LARGER**
+## AHHHH
+
+Getting clusters of the pruned set of constraints.
+
+## RECONFIGURED THE INNER PROD. LOOKS NICE NOW
+
+```{r}
+factors <- c("Alpha", "Beta", "Gamma", "Delta", "Epsilon")
+manifest <- c("a", "b", "c", "d", "e") %>%
+  map(rep, each = 3) %>%
+  map(paste0, 1:3)
+
+flat_mans <- unlist(manifest)
+
+parname_table <- tibble(full = colnames(samp_ortho_std)[-1]) %>%
+  mutate(split = str_split(full, "[^a-zA-Z0-9]+"),
+         split = map(split, set_names, c("lhs", "rhs")),
+         op = str_extract(full, "[^a-zA-Z0-9]+")) %>%
+  unnest_wider(split)
+
+build_up_clusters <- parname_table %>%
+  mutate(type = case_when(op == "↔" & lhs %in% flat_mans & rhs %in% flat_mans & str_sub(lhs, 0, 1) == str_sub(rhs, 0, 1) ~ "within",
+                          op == "↔" & lhs %in% flat_mans & rhs %in% flat_mans ~ "between",
+                          op == "↔" ~ "facrels",
+                          op == "→" ~ "facrels",
+                          op == "_" ~ "loadings"),
+         type = factor(type, levels = c("between", "within", "loadings", "facrels"))) %>%
+  arrange(type) %>%
+  group_by(type) %>%
+  summarize(full = list(full)) %>%
+  ungroup() %>%
+  pull(full)
+
+fit <- pseudo_frobenius(samp_ortho_std, as.list(unlist(build_up_clusters)))
+fit_order <- fit[[1]][[1]]
+# orderings <- map(build_up_clusters, as.list) %>% map(pseudo_frobenius, mat = samp_ortho_std) %>% map(1) %>% map(1)
+orderings <- map(build_up_clusters, match, fit_order) %>% map(order) %>% map2(build_up_clusters, \(x, y) y[x])
+plot_correlations_clustered(samp_ortho_std, orderings) +
+  theme(axis.text = element_blank())
+
+# plot_correlations_clustered(samp_ortho_std, list(orderings[[4]][-c(1, 4, 6, 9, 11, 17)]))
+
+```
+
+# Partial separability!
+
+## Within and loading together
+
+```{r}
+mat <- samp_ortho_std
+
+clusters_between <- pseudo_frobenius(mat, as.list(build_up_clusters[[1]])) %>%
+  pluck(2) %>%
+  get_state(10, build_up_clusters[[1]], mat) %>%
+  pluck(1)
+
+clusters_within <- pseudo_frobenius(mat, as.list(unlist(build_up_clusters[2]))) %>%
+  pluck(2) %>%
+  get_state(5, unlist(build_up_clusters[2]), mat) %>%
+  pluck(1)
+
+clusters_loading <- pseudo_frobenius(mat, as.list(unlist(build_up_clusters[3]))) %>%
+  pluck(2) %>%
+  get_state(5, unlist(build_up_clusters[3]), mat) %>%
+  pluck(1)
+
+clusters_facrel <- pseudo_frobenius(mat, as.list(unlist(build_up_clusters[4]))) %>%
+  pluck(2) %>%
+  get_state(10, unlist(build_up_clusters[4]), mat) %>%
+  pluck(1)
+
+clusters_facrel <- list(
+    c("Alpha→Epsilon", "Alpha↔Epsilon"),
+    c("Beta→Epsilon", "Beta↔Epsilon"), # "Gamma↔Epsilon"),
+    c("Alpha→Gamma", "Alpha↔Gamma"), # "Gamma→Alpha",
+    #   "Beta↔Gamma", "Gamma→Beta"),
+    c("Alpha↔Delta", "Alpha→Delta", "Delta→Alpha"),
+    c("Delta→Beta", "Beta↔Delta", "Beta→Delta"),
+    c("Delta→Gamma", "Gamma↔Delta", "Gamma→Delta")
+)
+clusters_facrel <- list(unlist(clusters_facrel, recursive = FALSE))
+
+# add a<->a to the loading cluster to avoid zero partial
+clusters_loading <- clusters_loading[c(5, 1, 2, 3, 4)]
+clusters_loading <- map2(clusters_within, clusters_loading, c)
+
+clusters_full <- c(clusters_facrel, clusters_loading, clusters_between)
+clusters_full2 <- c(unlist(clusters_facrel), clusters_loading, clusters_between)
+```
+
+### Stats
+
+```{r}
+acc_remaining <- c(list(character(0)),
+                   accumulate(clusters_full, c)[-length(clusters_full)])
+partial_full <- map(clusters_full, \(x) c("resids", x)) %>%
+  map2(acc_remaining, partial_mat, mat = mat)
+
+A <- map(partial_full, \(x) x[-1, -1]) %>% do.call(what = lav_matrix_bdiag)
+rownames(A) <- colnames(A) <- unlist(clusters_full)
+
+plot_correlations_clustered(A, clusters_full)
+```
+
+
+```{r}
+tol <- 1e-8
+mat_full_zero <- map(clusters_full, \(x) mat[x, x]) %>%
+  map(MASS::ginv) %>%
+  map2(clusters_full, \(x, y) mat[c("resids", y), y] %*% x %*% mat[y, c("resids", y)])
+
+zero_x2 <- round(map_dbl(mat_full_zero, \(x) x[1, 1]) * samp_mats$modinds[1], 2)
+zero_df <- map_dbl(mat_full_zero, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+zero_p <- round(pchisq(zero_x2, zero_df, lower.tail = FALSE), 2)
+zero_MI_full <- map_dbl(mat_full_zero, \(x) max(x[1, -1]^2 / diag(x)[-1]))
+zero_mi <- round(zero_MI_full * samp_mats$modinds[1], 2)
+zero_p_mi <- round(pchisq(zero_mi, 1, lower.tail = FALSE), 2)
+```
+
+
+```{r}
+mat_full <- map(partial_full, \(x) x[, -1] %*% MASS::ginv(x[-1, -1]) %*% x[-1, ])
+
+LM_full <- map_dbl(mat_full, \(x) x[1, 1])
+x2 <- round(LM_full * samp_mats$modinds[1], 2)
+df <- map_dbl(mat_full, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 2)
+MI_full <- map_dbl(mat_full, \(x) max((x[1, -1]^2 / diag(x)[-1])[diag(x)[-1] > tol]))
+mi <- round(MI_full * samp_mats$modinds[1], 2)
+p_mi <- round(pchisq(mi, 1, lower.tail = FALSE), 2)
+```
+
+
+```{r}
+clusters_facrel_names <- map(clusters_facrel, str_split, "↔|→") %>%
+  map(unlist) %>%
+  map(unique) %>%
+  map(sort) %>%
+  map_chr(paste0, collapse = "↔")
+
+clusters_loading_names <- map(clusters_loading, str_replace_all, "\\d+", "") %>%
+  map(str_replace_all, "[A-Za-z]+_", "F_") %>%
+  map(unique) %>%
+  map(sort) %>%
+  map_chr(paste0, collapse = ",")
+
+clusters_between_names <- map(clusters_between, str_replace_all, "\\d+", "") %>%
+  map_chr(unique)
+
+names_full <- c(clusters_facrel_names, clusters_loading_names, clusters_between_names)
+block_full <- c(rep_along(clusters_facrel, "Structural"),
+                rep_along(clusters_loading, "Measurement"),
+                rep_along(clusters_between, "ErrorCov"))
+```
+
+
+```{r}
+results_table <- tibble(# name = names_full, block = block_full,
+                        X2.0 = zero_x2, df.0 = zero_df, p.0 = zero_p,
+                        MI.0 = zero_mi, p.MI.0 = zero_p_mi,
+                        X2 = x2, df = df, p = p, MI = mi, p.MI = p_mi)
+
+results_table
+```
+
+
+```{r}
+D <- MASS::ginv(mat) %*%
+  mat
+DD <- diag(sqrt(diag(D))) + 0*mat
+```
+
+
+```{r}
+Ds <- map(clusters_full, \(x) MASS::ginv(mat[x, x]) %*% mat[x, x])
+DDs <- map2(clusters_full, Ds, \(x, D) diag(sqrt(diag(D))) + 0*mat[x, x])
+```
+
+
+```{r}
+L <- compute_basis(mat[unlist(clusters_full), unlist(clusters_full)])
+res_loads <- crossprod(L, MASS::ginv(mat[unlist(clusters_full), unlist(clusters_full)])) %*%
+  mat[unlist(clusters_full), 1]
+
+zero_MI_avg <- map2_dbl(clusters_full, DDs, \(x, DD) sum((DD %*% mat[x, 1])^2))
+
+K <- ncol(L)
+n <- 5e4
+X <- replicate(n, rnorm(K))
+Y <- sweep(X, 2, sqrt(colSums(X^2)), "/")
+est_avg <- map2(clusters_full, DDs, \(x, DD) colSums((DD %*% L[x, ] %*% Y)^2))
+avg_lb <- map_dbl(est_avg, quantile, 0.025)
+avg_ub <- map_dbl(est_avg, quantile, 0.975)
+```
+
+
+```{r}
+rots <- map(clusters_full, targeted_rotation, A = mat[unlist(clusters_full), unlist(clusters_full)])
+zero_MI_avg <- map2(clusters_full, rots, \(x, r) colSums((L[x, ] %*% r)^2)) %>%
+  map2_dbl(rots, \(x, r) colSums(x %*% (t(r) %*% res_loads)^2))
+est_avg <- map2(clusters_full, rots, \(x, r) colSums((L[x, ] %*% r)^2)) %>%
+  map2(rots, \(x, r) colSums(x %*% (t(r) %*% Y)^2))
+avg_lb <- map_dbl(est_avg, quantile, 0.025)
+avg_ub <- map_dbl(est_avg, quantile, 0.975)
+```
+
+
+```{r}
+Q <- partial_mat(mat, c("resids", c(unlist(clusters_loading))), clusters_full[[1]][-c(7, 9, 10, 11, 13, 14, 15)])
+R <- cov2cor(Q)
+L2 <- compute_basis(R[-1, -1])
+```
+
+
+```{r}
+Ds <- map(clusters_loading, \(x) MASS::ginv(Q[x, x]) %*% Q[x, x])
+DDs <- map2(clusters_loading, Ds, \(x, D) diag(sqrt(diag(D))) + 0*Q[x, x])
+```
+
+
+```{r}
+zero_MI_avg2 <- map2_dbl(clusters_loading, DDs, \(x, DD) sum((DD %*% R[1, x])^2))
+
+K2 <- ncol(L2)
+X2 <- replicate(n, rnorm(K2))
+Y2 <- sweep(X2, 2, sqrt(colSums(X2^2)), "/")
+est_avg2 <- map2(clusters_loading, DDs, \(x, DD) colSums((DD %*% L2[x, ] %*% Y2)^2))
+avg_lb2 <- map_dbl(est_avg2, quantile, 0.025)
+avg_ub2 <- map_dbl(est_avg2, quantile, 0.975)
+```
+
+
+```{r}
+tibble(name = names_full, block = block_full,
+       df.0 = zero_df, 
+       R.0 = round(zero_MI_avg, 2),
+       lb.0 = round(avg_lb, 2),
+       ub.0 = round(avg_ub, 2))
+```
+
+
+```{r}
+tibble(name = names_full,
+       block = block_full,
+       R.0 = round(zero_MI_avg, 3),
+       lb.0 = round(avg_lb, 3),
+       ub.0 = round(avg_ub, 3))
+```
+
+
+
+```{r}
+results_table %>%
+  filter(p.MI < 0.05) %>%
+  select(name, block) %>%
+  group_by(block) %>%
+  summarize(name = list(name)) %>%
+  mutate(name = set_names(name, block)) %>%
+  pull(name)
+  
+```
+
+At least one modification within each of these clusters has a significant MI, even after controlling for the blocks above.
+
+Because we cannot partial out a cluster in a lower block from on in higher without nulling the modifications, we cannot know how making a modification from a lower block will impact the MIs of higher blocks.
+
+So, we should try to consider modifications from bottom to top, assuming that we might end up nulling the contribution of a modification in a higher block if we find one in the lower blocks theoretically appealing. Especially if the lower modification spans a higher.
+
+Indeed we can check to see how much partialling impacts the other blocks. Let's consider the impact of "c↔c,F_c" or "d↔d,F_d" on "Delta↔Gamma".
+
+```{r}
+chosen <- c("resids", clusters_facrel[[6]])
+remain <- unlist(c(clusters_loading[c(3)], clusters_facrel[0]))
+
+partial_focus <- partial_mat(mat, chosen, remain)
+mat_focus <- partial_focus[, -1] %*% MASS::ginv(partial_focus[-1, -1]) %*% partial_focus[-1, ]
+
+MI_focus <- round(mat_focus[1, -1]^2 / diag(mat_focus)[-1] * samp_mats$modinds[1], 2)
+MI_focus[diag(mat_focus)[-1] < sqrt(.Machine$double.eps)] <- 0
+MI_focus_p <- pchisq(MI_focus, 1, lower.tail = FALSE)
+
+min(MI_focus_p) < 0.05
+
+names(which(diag(partial_focus)[-1] < sqrt(.Machine$double.eps)))
+```
+
+F_c knocks out Delta→Gamma and Gamma↔Delta
+
+```{r}
+chosen <- c("resids", clusters_facrel[[6]])
+remain <- unlist(c(clusters_loading[c(4)], clusters_facrel[0]))
+
+partial_focus <- partial_mat(mat, chosen, remain)
+mat_focus <- partial_focus[, -1] %*% MASS::ginv(partial_focus[-1, -1]) %*% partial_focus[-1, ]
+
+MI_focus <- round(mat_focus[1, -1]^2 / diag(mat_focus)[-1] * samp_mats$modinds[1], 2)
+MI_focus[diag(mat_focus)[-1] < sqrt(.Machine$double.eps)] <- 0
+MI_focus_p <- pchisq(MI_focus, 1, lower.tail = FALSE)
+
+min(MI_focus_p) < 0.05
+
+names(which(diag(partial_focus)[-1] < sqrt(.Machine$double.eps)))
+```
+
+whereas F_d knocks out Gamma→Delta.
+
+So, it is possible that, in selecting a modification from F_c and F_d, we could explain some or all of the misfit associated with the structural relations between Gamma and Delta.
+
+```{r}
+results_table %>%
+  filter(p.0 > 0.05, p.MI < 0.05) %>%
+  select(name, block)
+```
+
+These clusters have at least one modification with a significant MI after controlling for the blocks above them, but were not significant before controlling.
+
+```{r}
+results_table %>%
+  filter(p.0 < 0.05, p.MI > 0.05) %>%
+  select(name, block)
+```
+
+## Clunkier old version
+
+```{r}
+mat <- samp_ortho_std
+
+clusters_between <- pseudo_frobenius(mat, as.list(build_up_clusters[[1]])) %>%
+  pluck(2) %>%
+  get_state(10, build_up_clusters[[1]], mat) %>%
+  pluck(1)
+
+clusters_within <- pseudo_frobenius(mat, as.list(unlist(build_up_clusters[2]))) %>%
+  pluck(2) %>%
+  get_state(5, unlist(build_up_clusters[2]), mat) %>%
+  pluck(1)
+
+clusters_loading <- pseudo_frobenius(mat, as.list(unlist(build_up_clusters[3]))) %>%
+  pluck(2) %>%
+  get_state(5, unlist(build_up_clusters[3]), mat) %>%
+  pluck(1)
+
+bad_facrels <- c("Gamma↔Epsilon", "Beta↔Gamma", "Beta↔Epsilon",
+                 "Gamma→Beta", "Epsilon→Beta", "Epsilon→Gamma", "Gamma→Alpha",
+                 "Epsilon→Alpha", "Epsilon→Delta")
+facrel_minus <- setdiff(build_up_clusters[[4]], bad_facrels)
+clusters_facrel <- pseudo_frobenius(mat, as.list(facrel_minus)) %>% 
+  pluck(2) %>%
+  get_state(1, facrel_minus, mat) %>%
+  pluck(1)
+
+clusters_facrel_split <- list(
+    c("Alpha→Epsilon", "Alpha↔Epsilon"),
+    c("Beta→Epsilon"),
+    c("Alpha→Gamma", "Alpha↔Gamma"),
+    c("Alpha↔Delta", "Alpha→Delta", "Delta→Alpha"),
+    c("Delta→Beta", "Beta↔Delta", "Beta→Delta"),
+    c("Delta→Gamma", "Gamma↔Delta", "Gamma→Delta")
+)
+
+all_clusters <- list(clusters_between, clusters_loading, clusters_facrel)
+
+partial_between <- partial_mat(mat, c("resids", unlist(all_clusters[1])),
+                               unlist(all_clusters[-1]))
+non_between <- all_clusters[-1]
+
+partial_loading <- partial_mat(mat, c("resids", unlist(non_between[1])),
+                                unlist(non_between[-1]))
+non_loadings <- non_between[-1]
+
+partial_facrel <- mat[c("resids", unlist(non_loadings)), c("resids", unlist(non_loadings))]
+
+clusters_all <- unlist(all_clusters, recursive = FALSE)
+A <- lav_matrix_bdiag(partial_between[-1, -1],
+                      partial_loading[-1, -1],
+                      partial_facrel[-1, -1])
+rownames(A) <- colnames(A) <- unlist(clusters_all)
+
+plot_correlations_clustered(A, rev(clusters_all))
+```
+
+
+Look at this, we can get these separate clusters in the between error-covs and loadings/within error-covs when we control for facrels/loadings/within and facrels, respectively.
+
+```{r}
+map(clusters_all, setdiff, x = unlist(clusters_all)) %>%
+  map2_dbl(clusters_all, \(x, y) max(mat[x, y]^2))
+
+map(clusters_all, setdiff, x = unlist(clusters_all)) %>%
+  map2_dbl(clusters_all, \(x, y) max(A[x, y]^2))
+```
+
+```{r}
+mat_between <- map(clusters_between, \(x) MASS::ginv(partial_between[x, x])) %>%
+  map2(clusters_between, \(x, y) x %*% partial_between[y, y] %*% x) %>%
+  map2(clusters_between, \(x, y) partial_between[c("resids", y), y] %*% x %*% partial_between[y, c("resids", y)])
+
+mat_loading <- map(clusters_loading, \(x) MASS::ginv(partial_loading[x, x])) %>%
+  map2(clusters_loading, \(x, y) x %*% partial_loading[y, y] %*% x) %>%
+  map2(clusters_loading, \(x, y) partial_loading[c("resids", y), y] %*% x %*% partial_loading[y, c("resids", y)])
+
+mat_facrel <- map(clusters_facrel, \(x) MASS::ginv(partial_facrel[x, x])) %>%
+  map2(clusters_facrel, \(x, y) x %*% partial_facrel[y, y] %*% x) %>%
+  map2(clusters_facrel, \(x, y) partial_facrel[c("resids", y), y] %*% x %*% partial_facrel[y, c("resids", y)])
+```
+
+
+```{r}
+LM_between <- map_dbl(mat_between, \(x) x[1, 1])
+LM_loading <- map_dbl(mat_loading, \(x) x[1, 1])
+LM_facrel <- map_dbl(mat_facrel, \(x) x[1, 1])
+
+sum(LM_between) + sum(LM_loading) + sum(LM_facrel)
+```
+
+```{r}
+MI_between <- map_dbl(mat_between, \(x) max(x[1, -1]^2 / diag(x)[-1]))
+MI_loading <- map_dbl(mat_loading, \(x) max(x[1, -1]^2 / diag(x)[-1]))
+MI_facrel <- map_dbl(mat_facrel, \(x) max(x[1, -1]^2 / diag(x)[-1]))
+```
+
+```{r}
+mat_between_zero <- map(clusters_between, \(x) mat[x, x]) %>%
+  map(MASS::ginv) %>%
+  map2(clusters_between, \(x, y) mat[c("resids", y), y] %*% x %*% mat[y, c("resids", y)])
+
+mat_between_struct <- map(clusters_between, \(x) c("resids", x)) %>%
+  map(partial_mat, mat = mat, remain = unlist(clusters_facrel)) %>%
+  map(\(x) x[, -1] %*% MASS::ginv(x[-1, -1]) %*% x[-1, ])
+
+x2 <- round(LM_between * samp_mats$modinds[1], 2)
+df <- map_dbl(clusters_between, \(x) sum(svd(partial_between[x, x], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 2)
+mi <- round(MI_between * samp_mats$modinds[1], 2)
+p_mi <- round(pchisq(mi, 1, lower.tail = FALSE), 2)
+zero_x2 <- round(map_dbl(mat_between_zero, \(x) x[1, 1]) * samp_mats$modinds[1], 2)
+zero_df <- map_dbl(mat_between_zero, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+zero_p <- round(pchisq(zero_x2, zero_df, lower.tail = FALSE), 2)
+struct_x2 <- round(map_dbl(mat_between_struct, \(x) x[1, 1]) * samp_mats$modinds[1], 2)
+struct_df <- map_dbl(mat_between_struct, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+struct_p <- round(pchisq(struct_x2, struct_df, lower.tail = FALSE), 2)
+
+m <- cbind(X2.zero = zero_x2, df.zero = zero_df, p.zero = zero_p,
+           X2.struct = struct_x2, df.struct = struct_df, p.struct = struct_p,
+           X2 = x2, df = df, p = p, Max.MI = mi, p.MI = p_mi)
+rownames(m) <- map(clusters_between, str_replace_all, "\\d+", "") %>%
+  map_chr(unique)
+
+m[c("a↔b", "a↔c", "a↔d", "a↔e", "b↔c", "b↔d", "b↔e", "c↔d", "c↔e", "d↔e"), ]
+```
+
+```{r}
+mat_loading_zero <- map(clusters_loading, \(x) mat[x, x]) %>%
+  map(MASS::ginv) %>%
+  map2(clusters_loading, \(x, y) mat[c("resids", y), y] %*% x %*% mat[y, c("resids", y)])
+
+x2 <- round(LM_loading * samp_mats$modinds[1], 3)
+df <- map_dbl(clusters_loading, \(x) sum(svd(partial_loading[x, x], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 3)
+mi <- round(MI_loading * samp_mats$modinds[1], 3)
+p_mi <- round(pchisq(mi, 1, lower.tail = FALSE), 3)
+zero_x2 <- round(map_dbl(mat_loading_zero, \(x) x[1, 1]) * samp_mats$modinds[1], 3)
+zero_df <- map_dbl(mat_loading_zero, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+zero_p <- round(pchisq(zero_x2, zero_df, lower.tail = FALSE), 3)
+
+m <- cbind(X2.zero = zero_x2, df.zero = zero_df, p.zero = zero_p,
+           X2 = x2, df = df, p = p, Max.MI = mi, p.MI = p_mi)
+rownames(m) <- map(clusters_loading, str_subset, "↔", negate = TRUE) %>%
+  map(str_replace_all, "\\d+", "") %>%
+  map(str_replace_all, "[A-Za-z]+_", "F_") %>%
+  map_chr(unique)
+
+m[c("F_a", "F_b", "F_c", "F_d", "F_e"), ]
+```
+
+```{r}
+x2 <- round(LM_facrel * samp_mats$modinds[1], 3)
+df <- map_dbl(clusters_facrel, \(x) sum(svd(A[x, x], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 3)
+mi <- round(MI_facrel * samp_mats$modinds[1], 3)
+p_mi <- round(pchisq(mi, 1, lower.tail = FALSE), 3)
+
+m <- cbind(X2 = x2, df = df, p.value = p, Max.MI = mi, p.value.MI = p_mi)
+m
+```
+
+```{r}
+acc_remaining <- c(list(character(0)),
+                   accumulate(clusters_facrel_split, c)[-length(clusters_facrel_split)])
+partial_facrel_split <- map(clusters_facrel_split, \(x) c("resids", x)) %>%
+  map2(acc_remaining, partial_mat, mat = mat)
+
+A <- map(partial_facrel_split, \(x) x[-1, -1]) %>% do.call(what = lav_matrix_bdiag)
+rownames(A) <- colnames(A) <- unlist(clusters_facrel_split)
+plot_correlations_clustered(A, clusters_facrel_split)
+```
+
+```{r}
+mat_facrel_split <- map2(clusters_facrel_split, partial_facrel_split,
+                         \(x, y) MASS::ginv(y[x, x])) %>%
+  map2(partial_facrel_split, \(x, y) y[, -1] %*% x %*% y[-1, ])
+
+LM_facrel_split <- map_dbl(mat_facrel_split, \(x) x[1, 1])
+```
+
+
+```{r}
+x2 <- round(LM_facrel_split * samp_mats$modinds[1], 3)
+df <- map_dbl(partial_facrel_split, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 3)
+MI_facrel_split <- map_dbl(mat_facrel_split, \(x) max(x[1, -1]^2 / diag(x)[-1]))
+mi <- round(MI_facrel_split * samp_mats$modinds[1], 3)
+p_mi <- round(pchisq(mi, 1, lower.tail = FALSE), 3)
+
+mat_facrel_zero <- map(clusters_facrel_split, \(x) mat[x, x]) %>%
+  map(MASS::ginv) %>%
+  map2(clusters_facrel_split, \(x, y) mat[c("resids", y), y] %*% x %*% mat[y, c("resids", y)])
+
+zero_x2 <- round(map_dbl(mat_facrel_zero, \(x) x[1, 1]) * samp_mats$modinds[1], 3)
+zero_df <- map_dbl(mat_facrel_zero, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+zero_p <- round(pchisq(zero_x2, zero_df, lower.tail = FALSE), 3)
+
+m <- cbind(X2.zero = zero_x2, df.zero = zero_df, p.zero = zero_p,
+           X2 = x2, df = df, p.value = p, Max.MI = mi, p.value.MI = p_mi)
+rownames(m) <- map(clusters_facrel_split, str_split, "↔|→") %>%
+  map(unlist) %>%
+  map(unique) %>%
+  map(sort) %>%
+  map(paste0, collapse = "↔")
+
+m
+```
+
+There's at least one modification in each of these blocks that, even after controlling for the blocks above it, has a significant MI.
+
+## Revising the facrel cluster
+
+```{r}
+mat <- samp_ortho_std - tcrossprod(samp_ortho_std[, "c2↔e2", drop = FALSE])
+clusters_between <- pseudo_frobenius(mat, as.list(build_up_clusters[[1]])) %>%
+  pluck(2) %>%
+  get_state(1, build_up_clusters[[1]], mat) %>%
+  pluck(1)
+
+
+loading_minus <- unlist(build_up_clusters[2:3]) %>%
+  intersect(samp_targets)
+clusters_loading <- pseudo_frobenius(mat, as.list(loading_minus)) %>%
+  pluck(2) %>%
+  get_state(2, loading_minus, mat) %>%
+  pluck(1)
+
+facrel_minus <- build_up_clusters[[4]] %>%
+  intersect(samp_targets)
+clusters_facrel <- facrel_minus %>%
+  as.list() %>%
+  pseudo_frobenius(mat = mat) %>% 
+  pluck(2) %>%
+  get_state(1, facrel_minus, mat) %>%
+  pluck(1)
+
+all_clusters <- list(clusters_between, clusters_loading, clusters_facrel)
+
+partial_between <- partial_mat(mat, c("resids", unlist(all_clusters[1])),
+                               unlist(all_clusters[-1]))
+non_between <- all_clusters[-1]
+
+partial_loading <- partial_mat(mat, c("resids", unlist(non_between[1])),
+                                unlist(non_between[-1]))
+non_loadings <- non_between[-1]
+
+partial_facrel <- mat[c("resids", unlist(non_loadings)), c("resids", unlist(non_loadings))]
+
+clusters_all <- unlist(all_clusters, recursive = FALSE)
+A <- lav_matrix_bdiag(partial_between[-1, -1],
+                      partial_loading[-1, -1],
+                      partial_facrel[-1, -1])
+rownames(A) <- colnames(A) <- unlist(clusters_all)
+
+plot_correlations_clustered(A, clusters_all)
+```
+
+
+Look at this, we can get these separate clusters in the between error-covs and loadings/within error-covs when we control for facrels/loadings/within and facrels, respectively.
+
+```{r}
+map(clusters_all, setdiff, x = unlist(clusters_all)) %>%
+  map2_dbl(clusters_all, \(x, y) norm(mat[x, y, drop = FALSE], type = "F"))
+
+map(clusters_all, setdiff, x = unlist(clusters_all)) %>%
+  map2_dbl(clusters_all, \(x, y) norm(A[x, y, drop = FALSE], type = "F"))
+```
+
+```{r}
+mat_between <- map(clusters_between, \(x) MASS::ginv(partial_between[x, x])) %>%
+  map2(clusters_between, \(x, y) x %*% partial_between[y, y] %*% x) %>%
+  map2(clusters_between, \(x, y) partial_between[c("resids", y), y] %*% x %*% partial_between[y, c("resids", y)])
+
+mat_loading <- map(clusters_loading, \(x) MASS::ginv(partial_loading[x, x])) %>%
+  map2(clusters_loading, \(x, y) x %*% partial_loading[y, y] %*% x) %>%
+  map2(clusters_loading, \(x, y) partial_loading[c("resids", y), y] %*% x %*% partial_loading[y, c("resids", y)])
+
+mat_facrel <- map(clusters_facrel, \(x) MASS::ginv(partial_facrel[x, x])) %>%
+  map2(clusters_facrel, \(x, y) x %*% partial_facrel[y, y] %*% x) %>%
+  map2(clusters_facrel, \(x, y) partial_facrel[c("resids", y), y] %*% x %*% partial_facrel[y, c("resids", y)])
+```
+
+
+```{r}
+LM_between <- map_dbl(mat_between, \(x) x[1, 1])
+LM_loading <- map_dbl(mat_loading, \(x) x[1, 1])
+LM_facrel <- map_dbl(mat_facrel, \(x) x[1, 1])
+
+sum(LM_between) + sum(LM_loading) + sum(LM_facrel)
+```
+
+```{r}
+MI_between <- map_dbl(mat_between, \(x) max(x[1, -1]^2))
+MI_loading <- map_dbl(mat_loading, \(x) max(x[1, -1]^2))
+MI_facrel <- map_dbl(mat_facrel, \(x) max(x[1, -1]^2))
+```
+
+
+```{r}
+tol <- sqrt(.Machine$double.eps)
+
+x2 <- round(LM_between * samp_mats$modinds[1], 3)
+df <- map_dbl(clusters_between, \(x) sum(svd(A[x, x], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 3)
+
+m <- cbind(X2 = x2, df = df, p.value = p)
+# rownames(m) <- c("ab", "ac", "ad", "ae", "bc", "bd", "be", "cd", "ce", "de")
+
+m
+```
+
+
+Why would this have LESS projection onto it that if it only had a single modification in each cluster?
+
+```{r}
+x2 <- round(LM_loading * samp_mats$modinds[1], 3)
+df <- map_dbl(clusters_loading, \(x) sum(svd(A[x, x], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 3)
+
+m <- cbind(X2 = x2, df = df, p.value = p)
+rownames(m) <- c("F_d", "F_c")
+
+m[c("F_c", "F_d"), ]
+```
+
+```{r}
+x2 <- round(LM_facrel * samp_mats$modinds[1], 3)
+df <- map_dbl(clusters_facrel, \(x) sum(svd(A[x, x], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 3)
+
+cbind(X2 = x2, df = df, p.value = p)
+```
+
+
+# Nominal clusters
+
+```{r}
+mat <- samp_ortho_std[-1, -1]
+clusters_between <- pseudo_frobenius(mat, as.list(build_up_clusters[[1]])) %>%
+  pluck(2) %>%
+  get_state(10, build_up_clusters[[1]], mat) %>%
+  pluck(1)
+
+clusters_within <- pseudo_frobenius(mat, as.list(build_up_clusters[[2]])) %>%
+  pluck(2) %>%
+  get_state(5, build_up_clusters[[2]], mat) %>%
+  pluck(1)
+
+clusters_loading <- pseudo_frobenius(mat, as.list(build_up_clusters[[3]])) %>%
+  pluck(2) %>%
+  get_state(5, build_up_clusters[[3]], mat) %>%
+  pluck(1)
+
+clusters_facrel <- pseudo_frobenius(mat, as.list(build_up_clusters[[4]])) %>% 
+  pluck(2) %>%
+  get_state(3, build_up_clusters[[4]], mat) %>%
+  pluck(1)
+
+split_clusters <- c(clusters_between, clusters_within, clusters_loading, clusters_facrel)
+fit <- pseudo_frobenius(mat, split_clusters)
+plot(pseudo_to_hclust(fit), hang = -1); abline(h = 0.75)
+```
+
+```{r}
+o <- unlist(fit[[1]])
+state <- fit %>%
+  pluck(2) %>%
+  get_state(6, split_clusters, mat)
+
+clusters <- state %>%
+  pluck(1)
+
+clusters <- clusters[order(map_dbl(clusters, \(x) min(match(x, o))))] %>%
+  map(~ .x[order(match(.x, o))]) %>%
+  rev()
+
+plot_correlations_clustered(mat, clusters)
+```
+
+
+```{r}
+redex <- seq_along(clusters)
+acc_remaining <- c(list(character(0)), accumulate(clusters[redex], c)[-length(redex)])
+part_mats <- map(clusters[redex], \(x) c("resids", x)) %>% map2(acc_remaining, partial_mat, mat = samp_ortho_std)
+map(part_mats, diag) %>% map(\(x) x[-1]) %>% map(min)
+```
+
+
+```{r}
+partial_clusters <- imap(clusters, \(x, y) partial_mat(mat, x, unlist(clusters[-y]))) %>% map(\(x) names(which(diag(x) > sqrt(.Machine$double.eps))))
+
+plot_correlations_clustered(mat, partial_clusters)
+```
+
+
+```{r}
+select_split_clusters <- c(clusters_between, clusters_within, clusters_loading, clusters_facrel) %>%
+  map(intersect, samp_select) %>% compact()
+select_fit <- pseudo_frobenius(mat, select_split_clusters)
+plot(pseudo_to_hclust(select_fit), hang = -1); abline(h = 0.75)
+```
+
+```{r}
+select_o <- unlist(select_fit[[1]])
+select_state <- select_fit %>%
+  pluck(2) %>%
+  get_state(4, select_split_clusters, mat)
+
+select_clusters <- select_state %>%
+  pluck(1)
+
+select_clusters <- select_clusters[order(map_dbl(select_clusters, \(x) min(match(x, select_o))))] %>%
+  map(~ .x[order(match(.x, select_o))])
+
+plot_correlations_clustered(mat, select_clusters)
+```
+
+
+## New PCA clustering
+
+```{r}
+L <- varimax(compute_basis(samp_ortho_std[-1, -1]))$loadings
+clust_fit <- hclust(as.dist(1 - cov2cor(crossprod(L^2))), method = "single")
+plot(clust_fit)
+```
+
+
+```{r}
+nclust <- 10; 
+dim_clusters <- map(seq_len(nclust), \(x) names(which(cutree(clust_fit, nclust)[clust_fit$order] == x)))
+ordering <- rownames(L)[hclust(as.dist(sqrt(pmax(1 - samp_ortho_std[rownames(L), rownames(L)]^2, 0))), method = "ward.D")$order]
+clusters <- map(dim_clusters, \(x) L[, x]) %>% map(tcrossprod) %>% map(\(x) diag(x)) %>% do.call(what = cbind) %>% apply(1, which.max) %>% {map(seq_len(nclust), \(x) names(which(. == x)))} %>% map(\(x) x[order(match(x, ordering))])
+```
+
+
+```{r}
+plot_correlations_clustered(samp_ortho_std, clusters)
+```
+
+```{r}
+plot_correlations(L[unlist(clusters), unlist(dim_clusters)], sort = TRUE)
+```
+
+```{r}
+L_full <- samp_ortho_std[c("resids", rownames(L)), rownames(L)] %*% MASS::ginv(tcrossprod(L)) %*% L
+map(dim_clusters, \(x) rowSums(L_full[, x, drop = FALSE]^2)) %>%
+  do.call(what = cbind) %>%
+  {rbind(Residual = .["resids", ] / max(.["resids", ]), load_order(.[setdiff(rownames(.), "resids"), ]))} %>%
+  plot_correlations(sort = FALSE)
+```
+
+
+# Old Pseudo Frobenius
+
+```{r, eval = FALSE}
+mat <- samp_ortho_std
+# sels <- colnames(samp_ortho_std)[-1]
+# sels <- unlist(clusters_full)
+sels <- unlist(clusters_facrel)
+
+# helps make the norm(..., "F") method really clean
+DD <- diag(sqrt(diag(MASS::ginv(mat[sels, sels]) %*% mat[sels, sels]))) + 0*mat[sels, sels]
+M <- DD %*% mat[sels, sels] %*% DD
+D <- replicate(nrow(M), diag(M)) + t(replicate(nrow(M), diag(M))) - 2*M + 4e-15
+
+fit <- pseudo_frobenius(M, as.list(sels))
+o <- unlist(fit[[1]])
+```
+
+
+```{r, eval = FALSE}
+state <- fit %>%
+  pluck(2) %>%
+  get_state(5, sels, samp_ortho_std)
+
+clusters <- state %>%
+  pluck(1)
+
+clusters <- clusters[order(map_dbl(clusters, \(x) min(match(x, o))))] %>%
+  map(~ .x[order(match(.x, o))])
+
+clust_cor_mat <- state[[2]]
+map_dbl(clusters, length)
+grouped_facrel_clusters <- clusters
+```
+
+```{r}
+clusters_loading <- map(clusters_loading, setdiff, unlist(clusters_within))
+clusters_full <- c(clusters_facrel, clusters_loading, clusters_within, clusters_between)
+mat <- samp_ortho_std
+# grouped_facrel_clusters <- list(
+#   c("Alpha→Gamma", "Alpha↔Gamma"),
+#   c("Alpha→Epsilon", "Alpha↔Epsilon", "Beta→Epsilon", "Beta↔Epsilon"),
+#   c("Alpha↔Delta", "Alpha→Delta", "Delta→Alpha",
+#     "Delta→Beta",  "Beta↔Delta",  "Beta→Delta",
+#     "Delta→Gamma", "Gamma↔Delta", "Gamma→Delta")
+# )
+
+clusts <- c(grouped_facrel_clusters, clusters_loading, clusters_within, clusters_between)
+# clusts <- as.list(unlist(clusters_full))
+sels <- unlist(clusts)
+DD <- diag(sqrt(diag(MASS::ginv(mat[sels, sels]) %*% mat[sels, sels]))) + 0*mat[sels, sels]
+M <- DD %*% mat[sels, sels] %*% DD
+D <- replicate(nrow(M), diag(M)) + t(replicate(nrow(M), diag(M))) - 2*M + 4e-15
+
+fit <- pseudo_frobenius_freeze(M, clusts, c(unlist(clusters_between), unlist(clusters_loading), unlist(clusters_within)))
+o <- unlist(clusts)
+```
+
+
+```{r, eval = FALSE}
+state <- fit %>%
+  pluck(2) %>%
+  get_state(length(clusts) - 5, clusts, samp_ortho_std)
+
+clusters <- state %>%
+  pluck(1)
+
+clusters <- clusters[order(map_dbl(clusters, \(x) min(match(x, o))))] %>%
+  map(~ .x[order(match(.x, o))])
+
+clust_cor_mat <- state[[2]]
+map_dbl(clusters, length)
+```
+
+
+```{r}
+fit <- pseudo_frobenius_freeze(M, clusters, c(unlist(clusters_between), unlist(clusters_loading)))
+o <- unlist(clusts)
+```
+
+
+```{r, eval = FALSE}
+state <- fit %>%
+  pluck(2) %>%
+  get_state(15, clusters, samp_ortho_std)
+
+clusters <- state %>%
+  pluck(1)
+
+clusters <- clusters[order(map_dbl(clusters, \(x) min(match(x, o))))] %>%
+  map(~ .x[order(match(.x, o))])
+
+clust_cor_mat <- state[[2]]
+map_dbl(clusters, length)
+```
+
+
+```{r}
+fit <- pseudo_frobenius_freeze(M, clusters, unlist(clusters_between))
+o <- unlist(clusts)
+```
+
+
+```{r, eval=FALSE}
+k <- 3
+cut_val <- mean(c(0, rev(fit[[3]]))[seq_len(2) + k])
+plot(fit[[3]], log = "y"); abline(h = exp(mean(log(c(0, rev(fit[[3]]))[seq_len(2) + k]))))
+```
+
+```{r, eval = FALSE}
+o <- unlist(clusts)
+state <- fit %>%
+  pluck(2) %>%
+  get_state(9, clusters, samp_ortho_std)
+
+clusters <- state %>%
+  pluck(1)
+
+clusters <- clusters[order(map_dbl(clusters, \(x) min(match(x, o))))] %>%
+  map(~ .x[order(match(.x, o))])
+
+clust_cor_mat <- state[[2]]
+map_dbl(clusters, length)
+```
+
+```{r}
+mat <- samp_ortho_std
+acc_remaining <- c(list(character(0)),
+                   accumulate(clusters, c)[-length(clusters)])
+partial_full <- map(clusters, \(x) c("resids", x)) %>%
+  map2(acc_remaining, partial_mat, mat = mat)
+
+A <- map(partial_full, \(x) x[-1, -1]) %>% do.call(what = lav_matrix_bdiag)
+rownames(A) <- colnames(A) <- unlist(clusters)
+
+plot_correlations_clustered(A, clusters)
+```
+
+
+```{r}
+tol <- 1e-8
+mat_full_zero <- map(clusters, \(x) mat[x, x]) %>%
+  map(MASS::ginv) %>%
+  map2(clusters, \(x, y) mat[c("resids", y), y] %*% x %*% mat[y, c("resids", y)])
+
+zero_x2 <- round(map_dbl(mat_full_zero, \(x) x[1, 1]) * samp_mats$modinds[1], 2)
+zero_df <- map_dbl(mat_full_zero, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+zero_p <- round(pchisq(zero_x2, zero_df, lower.tail = FALSE), 2)
+zero_MI_full <- map_dbl(mat_full_zero, \(x) max(x[1, -1]^2 / diag(x)[-1]))
+zero_mi <- round(zero_MI_full * samp_mats$modinds[1], 2)
+zero_p_mi <- round(pchisq(zero_mi, 1, lower.tail = FALSE), 2)
+```
+
+
+```{r}
+mat_full <- map(partial_full, \(x) x[, -1] %*% MASS::ginv(x[-1, -1]) %*% x[-1, ])
+
+LM_full <- map_dbl(mat_full, \(x) x[1, 1])
+x2 <- round(LM_full * samp_mats$modinds[1], 2)
+df <- map_dbl(mat_full, \(x) sum(svd(x[-1, -1], nu = 0, nv = 0)$d > tol))
+p <- round(pchisq(x2, df, lower.tail = FALSE), 2)
+MI_full <- map_dbl(mat_full, \(x) max((x[1, -1]^2 / diag(x)[-1])[diag(x)[-1] > tol]))
+mi <- round(MI_full * samp_mats$modinds[1], 2)
+p_mi <- round(pchisq(mi, 1, lower.tail = FALSE), 2)
+```
+
+
+```{r}
+results_table <- tibble(name = map_chr(partial_full, \(x) names(which.max(colSums(x[, -1, drop = FALSE]^2)))),
+                        X2.0 = zero_x2, df.0 = zero_df, p.0 = zero_p,
+                        MI.0 = zero_mi, p.MI.0 = zero_p_mi,
+                        X2 = x2, df = df, p = p, MI = mi, p.MI = p_mi)
+
+results_table
+```
+
+
+```{r}
+results_table %>% filter(p < 0.05)
+```
+
+
+```{r}
+plot_correlations_clustered(samp_ortho_std, clusters)
+```
+
+
+```{r, eval=FALSE}
+clust_fit <- hclust(as.dist(sqrt(1 - samp_ortho_std[sels, sels]^2 + 1e-12) + 1e-3), method = "ward.D")
+
+clust_fit$merge <- fit[[4]]
+clust_fit$order <- order(match(sels, unlist(fit[[1]])))
+clust_fit$height <- round(1 - fit[[3]] + 1e-5, 3)
+plot(clust_fit, hang = -1); abline(h = 1 - cut_val)
+```
+
+
+```{r}
+# k <- 10
+# sels <- colnames(samp_ortho_std)[-1]
+# old_sels <- sels
+# thresh <- 0.2 # sqrt(.Machine$double.eps)
+# 
+# fit <- pseudo_frobenius(samp_ortho_std, as.list(sels))
+# while (k > 2) {
+#   while (k > 2) {
+#     state <- fit %>%
+#       pluck(2) %>%
+#       get_state(k, sels, samp_ortho_std)
+# 
+#     clusters <- state %>%
+#       pluck(1) %>%
+#       map(~ .x[order(match(.x, o))])
+# 
+#     clusters <- clusters[order(map_dbl(clusters, \(x) mean(match(x, o))))]
+#     lens <- map_dbl(clusters, length)
+# 
+#     if (any(lens < 3)) {
+#       k <- k - 1
+#     } else {
+#       old_sels <- sels
+#       spans <- unlist(find_spanner_candidates(clusters, samp_ortho_std[-1, -1], thresh, FALSE))
+#       sels <- setdiff(sels, setdiff(spans, samp_select))
+#       break
+#     }
+#   }
+# 
+#   print(k)
+#   if (length(intersect(sels, old_sels)) == length(old_sels)) {
+#     thresh <- thresh + 0.01
+#     print(thresh)
+#     if (thresh > 0.92) {
+#       break
+#     }
+#   } else {
+#     fit <- pseudo_frobenius(samp_ortho_std, as.list(sels))
+#   }
+# }
+# 
+# o <- unlist(fit[[1]])
+# 
+# state <- fit %>%
+#   pluck(2) %>%
+#   get_state(k, sels, samp_ortho_std)
+# 
+# clusters <- state %>%
+#   pluck(1) %>%
+#   map(~ .x[order(match(.x, o))])
+# 
+# clusters <- clusters[order(map_dbl(clusters, \(x) mean(match(x, o))))]
+# lens <- map_dbl(clusters, length)
+# print(lens)
+# clust_cor_mat <- state[[2]]
+```
+
+
+```{r}
+target <- samp_select
+# target <- rem
+fit <- pseudo_frobenius(samp_ortho_std, as.list(target))
+o <- unlist(fit[[1]])
+state <- fit %>%
+  pluck(2) %>%
+  get_state(2, target, samp_ortho_std)
+
+clusters <- state %>%
+  pluck(1)
+
+clust_cor_mat <- state[[2]]
+
+clusters <- clusters[order(map_dbl(clusters, \(x) min(match(x, o))))] %>%
+  map(~ .x[order(match(.x, o))]) %>%
+  rev()
+
+map_dbl(clusters, length)
+```
+
+
+
+
+```{r}
+# plot_correlations(samp_ortho_std[samp_select, samp_select], sort = FALSE) +
+#     theme(axis.text.x = element_blank(),
+#           axis.title.x = element_blank(),
+#           axis.text = element_text(size = 10))
+# 
+# ggsave("cormat.png")
+```
+
+```{r}
+plot_correlations(samp_ortho_std[unlist(fit[[1]]), unlist(fit[[1]])], sort = FALSE) +
+    theme(axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          axis.text = element_text(size = 10))
+```
+
+### Cluster Plot
+
+```{r}
+plot_correlations_clustered(samp_ortho_std, clusters)
+
+# ggsave("cluster.png")
+```
+
+```{r}
+redex <- seq_along(clusters)# [c(1, 2, 4, 5, 3)]
+acc_remaining <- c(list(character(0)), accumulate(clusters[redex], c)[-length(redex)])
+part_mats <- map(clusters[redex], \(x) c("resids", x)) %>% map2(acc_remaining, partial_mat, mat = samp_ortho_std)
+map(part_mats, diag) %>% map(\(x) x[-1]) %>% map(min)
+```
+
+```{r}
+leftover_mat <- partial_mat(samp_ortho_std, colnames(samp_ortho_std), unlist(clusters))
+part_mats_left <- c(part_mats, list(leftover_mat))
+
+x2s <- -diff(c(map_dbl(part_mats_left, \(x) x[1, 1]), 0)) * samp_mats$modinds[1]
+dfs <- map_dbl(part_mats_left, \(x) sum(svd(x[-1, -1, drop = FALSE], nu = 0, nv = 0)$d > sqrt(.Machine$double.eps)))
+ps <- round(pchisq(x2s, dfs, lower.tail = FALSE), 2)
+mis <- map_dbl(part_mats_left, \(x) max(x[1, -1, drop = FALSE]^2)) * samp_mats$modinds[1]
+mips <- round(pchisq(mis, 1, lower.tail = FALSE), 2)
+
+cbind(index = c(seq_along(x2s[-1]), sum(dfs)), x2 = x2s, df = dfs, p.value = ps,
+      MI = mis, p.value.MI = mips) %>%
+  as.tibble()
+```
+
+
+```{r}
+plot_correlations(clust_cor_mat, normalize = FALSE, sort = FALSE)
+```
+
+
+
+### Writing
+
+After pruning, the LM covariance matrix can be decomposed into five blocks. The reordered matrix plot shown in FIGURE exhibits the mutual separability of most blocks; however, there are three that are less orthogonal than desired. These blocks correspond to constraints on the error-covariance among the self-concept indicators. One block contains constraints on error-covariances between indicators of different constructs, while the other two pertain to like-construct error-covariance. For the sake of simplifying the block structure, We could consider collapsing into a single cluster, but this would come at the cost of complexity of the overlap structure within the cluster. Because the between-cluster overlap is much less than the within-cluster overlap, we decide they should remain separate.
+
+
+## Multiple-LM
+
+
+```{r}
+clust_blocks <- map(clusters, ~ samp_ortho_std[.x, .x])
+chisqs <- map(clust_blocks, ~ MASS::ginv(.x)) %>%
+  map2(clusters, ., ~ samp_ortho_std[1, .x] %*% .y %*% samp_ortho_std[.x, 1]) %>%
+  map_dbl(~ .x * samp_mats$modinds["resids"])
+dfs <- map(clust_blocks, rankM, tol = sqrt(.Machine$double.eps)) %>%
+  as.numeric()
+ps <- pchisq(chisqs, dfs, lower.tail = FALSE)
+out <- cbind(chisq = chisqs, df = dfs, p = ps) %>%
+  round(3)
+
+out
+```
+
+
+
+```{r}
+R_group <- map(clust_blocks, ~ MASS::ginv(.x)) %>%
+  map2(clusters, ., ~ samp_ortho_std[, .x] %*% .y %*% samp_ortho_std[.x, ]) %>%
+  map(diag) %>%
+  do.call(what = cbind)
+colnames(R_group) <- seq_along(clusters)
+
+R_group[c("resids", unlist(clusters)), ] %>%
+  plot_correlations(normalize = FALSE, sort = FALSE, text = FALSE) +
+  geom_vline(xintercept = seq_along(clusters)[-length(clusters)] + 0.5, size = 1, linetype = "dashed") +
+  geom_hline(yintercept = length(unlist(clusters)) - cumsum(map_dbl(clusters, length))[-length(clusters)] + 0.5, size = 1, linetype = "dashed") +
+  geom_hline(yintercept = length(unlist(clusters)) + 0.5, size = 0.75) +
+  xlab("Cluster")
+```
+
+
+### Writing
+
+Computing the mulitple-LM statistics for each group, we find that only groups 2 and 4 are associated with misfit. Group 2 contains constraints on the error-covariances between indicators of different self-concept constructs, spanning a total of 8 dimensions. Group 4 contains constraints on the strucutral paths and error-covariance between TaskGoal indicators, spanning a total of 4 dimensions. None of the dimensions are shared between groups, but the overlap between the dimensions of Groups 1-3 is apparent in FIGURE. Just as before, we can decompose these dimensions into an orthogonal basis spanning the constraints in these groups.
+
+## Block diagonalizing decomposition
+
+```{r}
+L_full <- compute_basis(samp_ortho_std)
+L <- compute_basis(samp_ortho_std[unlist(select_clusters), unlist(select_clusters)])
+
+rotmat <- safe_varimax(L)$rotmat
+R <- L %*% rotmat
+
+clust_dims <- map(select_clusters, \(x) colMeans(R[x, ]^2)) %>%
+  do.call(what = cbind)
+
+dim_dexes <- apply(clust_dims, 1, which.max)
+
+clust_dexes <- map(seq_along(select_clusters), \(x) which(dim_dexes == x))
+  
+clust_loads <- map2(select_clusters, clust_dexes, \(x, y) safe_varimax(R[x, y, drop = FALSE], normalize = FALSE)) %>%
+  map("loadings")
+
+clust_lens <- cumsum(c(0, map_dbl(clust_dexes[-length(select_clusters)], length)))
+
+ordered_dexes <- map(clust_loads, \(x) order(-colSums(x^2))) %>%
+  map2(clust_lens, \(x, y) x + y)
+
+rownames_order <- map(clust_loads, \(x) load_order(x[, order(-colSums(x^2)), drop = FALSE])) %>%
+  map(rownames)
+
+clust_rotmat <- map2(select_clusters, clust_dexes, \(x, y) safe_varimax(R[x, y, drop = FALSE], normalize = FALSE)$rotmat) %>%
+  do.call(what = lav_matrix_bdiag)
+
+R_clust_unrot <- map(select_clusters, \(x) R[x, unlist(clust_dexes), drop = FALSE]) %>%
+  do.call(what = rbind)
+R_clust <- (R_clust_unrot %*% clust_rotmat)[unlist(rownames_order), unlist(ordered_dexes)]
+```
+
+#### Notes
+Basically, the row-ordering reflects how much the mods project onto the largest eigenvalues within the cluster. So we will go from most overlap to least overlap.
+
+Because structural mods will have more overlap, proceeding left to right when considering modifications effectively performs a structural BEFORE measurement as opposed to the opposite.
+
+
+```{r}
+plot_correlations(R_clust, sort = FALSE) +
+  geom_vline(xintercept = clust_lens[-1] + 0.5, linetype = "dashed") +
+  geom_hline(yintercept = length(unlist(select_clusters)) - cumsum(map_dbl(select_clusters, length))[-length(select_clusters)] + 0.5, linetype = "dashed")
+```
+
+```{r}
+R_clust_list <- map2(rownames_order, ordered_dexes, \(x, y) R_clust[x, sort(y), drop = FALSE])
+map(R_clust_list, load_order) %>% map(t) %>% map(load_order) %>% map(t) %>% map(load_order) %>% map(\(x) x^2) %>%
+  map(plot_correlations, sort = FALSE, normalize = TRUE)
+```
+
+```{r}
+map(rownames_order, \(x) do.call(map(ordered_dexes, \(y) rowSums(R_clust[x, y, drop = FALSE]^2)), what = cbind)) %>% do.call(what = rbind) %>%
+  plot_correlations(sort = FALSE)
+```
+
+
+"If I were to pick one of these factor relations, here's the causal directionality that's supported by theory..."
+
+Drops the unanalyzed and backwards regressions.
+
+"Now we still don't really have strong enough information to suggest which modifications to make. So we'll have to use LM statistic..."
+
+Drop bad mods, rerotate, project resids onto it.
+
+We can see four really jump out.
+
+```{r}
+R_sub <- R_clust[unlist(rownames_order), sort(unlist(ordered_dexes))] %>%
+  tcrossprod() %>%
+  compute_basis() %>%
+  varimax() %>%
+  pluck("loadings")
+R_sub <- load_order(t(load_order(t(load_order(R_sub[, order(-colSums(R_sub^2))])))))
+
+# Alternative way that uses the zero-order MI as a weight for rotation (don't need to filter first)
+# R_sub <- R_clust[c(rownames_order[[2]][5], rownames_order[[4]]), sort(c(ordered_dexes[[2]], ordered_dexes[[4]]))] %>%
+#   tcrossprod() %>%
+#   compute_basis()
+# R_sub <- R_sub %*% varimax(sweep(R_sub, 1, samp_ortho_std["resids", rownames(R_sub)], "*"), normalize = FALSE)$rotmat
+
+L_full_clust <- L_full[c("resids", rownames(R_sub)), ] %*% 
+  crossprod(L_full[rownames(R_sub), ], MASS::ginv(tcrossprod(R_sub))) %*% R_sub
+L_full_clust <- load_order(L_full_clust[, order(-L_full_clust[1, ]^2 * colSums(L_full_clust[-1, ]^2))])
+
+plot_correlations(sweep(L_full_clust[setdiff(rownames(L_full_clust), "resids"), ], 2, L_full_clust["resids", ] / sqrt(sum(L_full_clust["resids", ]^2)), "*")^2, sort = FALSE)
+```
+
+```{r}
+(diag(sweep(L_full_clust[c(1, 3, 4, 5, 6, 9), 1:6], 2, L_full_clust["resids", 1:6], "*")^2) * samp_mats$modinds[1]) %>% set_names(rownames(L_full_clust)[c(1, 3, 4, 5, 6, 9)])
+```
+
+
+"Remember we want to get at the "unique" misfit, so we can be a little less conservative in selecting by including all of the large MIs leftover. That way we sap away more of the shared misfit, give a more conservative estimate of the unique misfit."
+
+"check out the difference between zero-order MI and the unique MI"
+
+```{r}
+targets_plus <- c(targets, "Delta~Alpha")
+C <- samp_mats$info$ortho
+Q <- solve(samp_mats$info$ortho[targets_plus, targets_plus])
+samp_mats$modinds[targets_plus]
+(C["resids", targets_plus] %*% Q)[1, ]^2 / diag(Q) * N
+```
+
+"So this is equivalent to a backward step now. Looking at the insignificant "wald stat", we can see Gamma~~Delta and Delta~Alpha are not significant. We know they are orthogonal, so we can make our decision on both simultaneously."
+
+"Once we get rid of them, the stats are all significant.
+
+```{r}
+targets_minus <- targets[-5]
+C <- samp_mats$info$ortho
+Q <- solve(samp_mats$info$ortho[targets_minus, targets_minus])
+(C["resids", targets_minus] %*% Q)[1, ]^2 / diag(Q) * N
+```
+
+
+Multiple-LM statistic and p-value for each clusters' subspace.
+
+```{r}
+# out2 <- gs_block_rotation(samp_ortho_std, clusters, total_chisq = samp_mats$modinds[1])
+out2 <- regularized_rotation(samp_ortho_std, clusters, total_chisq = samp_mats$modinds[1])
+```
+
+
+### Subspace projection plot
+
+### Writing
+
+The subspace decomposition for the four clusters is displayed in FIGURE. Since the subspaces spanned by the members of each cluster are mutually orthogonal, we do not need to employ orthogonal rotations to distribute any shared dimensions between them.
+
+### Dimension projection plot
+
+
+```{r}
+out2$indiv +
+  theme(axis.text = element_text(size = 12))
+
+ggsave("components.png", width = 8, height = 7)
+```
+
+
+```{r, exec = FALSE}
+map(out2$clust_dims, \(x) x[, order(colSums(x[-1, ]^2))]) %>%    
+  map(\(x) sweep(x, 2, x[1, ], "*")) %>%
+  map(\(x) rbind(Residual = sqrt(x[1, ]), x[-1, ])) %>%
+  map(apply, 1, \(x) cumsum(x^2)) %>%
+  map(t) %>%
+  # map(\(x) x[, rev(seq_len(ncol(x)))]) %>%
+  map(load_order) %>%
+  # map(\(x) x[, rev(seq_len(ncol(x)))]) %>%
+  map(\(x) x[, x[1, ] > 0.05]) %>%
+  map(\(x) x / max(x[1, ])) %>%
+  map(\(x) x[apply(x, 1, max) > 0.05, ]) %>%
+  map(\(x) rbind(Residual = diff(c(0, x[1, ])), sweep(x[-1, ], 2, x[1, ], "/"))) %>%
+  map(\(x) rbind(Residual = x[1, ] / max(x[1,]), x[-1, ])) %>%
+  map(plot_correlations, sort = FALSE)
+```
+
+
+
+```{r}
+out2$group +
+  theme(axis.text = element_text(size = 12))
+```
+
+
+```{r}
+select_clusts <- c(misspecs[c(3, 4)], redherring, misspecs[2], misspecs[1]) %>%
+  str_replace_all("~~", "↔") %>%
+  str_replace_all("=~", "_") %>%
+  str_replace_all("(.*)~(.*)", "\\2→\\1")
+
+regularized_rotation(samp_ortho_std, list(select_clusts[-5], select_clusts[5]), total_chisq = samp_mats$modinds[1])$indiv +
+  theme(axis.text = element_text(size = 12))
+
+ggsave("sel_components.png", width = 5, height = 5)
+```
+
+
+```{r}
+C <- samp_mats$info$ortho
+Q <- solve(samp_mats$info$ortho[targets, targets])
+samp_mats$modinds[targets]
+(C["resids", targets] %*% Q)[1, ]^2 / diag(Q) * N
+```
+
+
+
+```{r}
+M <- samp_ortho_std - samp_ortho_std[, "Beta↔Delta"] %*% solve(samp_ortho_std["Beta↔Delta", "Beta↔Delta"]) %*% samp_ortho_std["Beta↔Delta", ]
+b <- names(which(diag(M)[clusters[[1]]] > 1e-8))
+out3 <- regularized_rotation(M, list(b, clusters[[2]]), total_chisq = samp_mats$modinds[1])
+
+out3$indiv
+```
+
+
+```{r}
+q <- names(which(rowSums(out3$R[, 1:4]^2) > 0.5))
+R_rem <- compute_basis(M[q, q])
+R_rem <- rbind(resids = (crossprod(R_rem, MASS::ginv(M[q, q])) %*% M[q, "resids"])[, 1], R_rem)
+R_rem <- sweep(R_rem, 2, sign(R_rem["resids", ]), "*")
+R_rem <- R_rem[, order(R_rem["resids", ]^2, decreasing = TRUE)]
+R_rem <- rbind(resids = R_rem["resids", ], load_order(R_rem[-1, ]))
+plot_correlations(R_rem, sort = FALSE)
+```
+
+
+### Writing
+
+Decomposing the Group 1 submatrix, we find that the misfit is almost entirely related to the first dimension. This first dimension is strongly related to X2->X5 only only slightly overlaps with X1->X5. We conclude that X2->X5 must be misspecified, and that any misfit associated with X1->X5 must only be due to its overlap with X2->X5.
+
+This step is a little overkill. If you are only choosing between two constraints, you will probably be fine just looking at the MIs (X2 = 13 vs. X2 = 2). However, MIs alone would not have been much help without first reducing the problem down to choosing between the two. At each step, this was facilitated by knowledge of how the constraints overlapped.
+
+
+## Impact on free parameters
+
+```{r}
+C <- cov2cor(vcov(samp_fit))
+free_clust <- unlist(pseudo_frobenius(C, as.list(samp_free))[[1]])
+
+plot_correlations(C[free_clust, free_clust], sort = FALSE)
+
+free_renames <- str_replace_all(free_clust, "~~", "↔") %>%
+  str_replace_all("=~", "→") %>%
+  str_replace_all("(.*)~(.*)", "\\2→\\1")
+```
+
+
+```{r}
+M <- samp_mats$info$full[-1, -1]
+
+M_renames <- str_replace_all(colnames(M), "~~", "↔") %>%
+  str_replace_all("=~", "→") %>%
+  str_replace_all("(.*)~(.*)", "\\2→\\1")
+dimnames(M) <- rerun(2, M_renames)
+
+H <- M*0 + diag(ncol(M))
+H[free_renames, free_renames] <- 0
+H <- H[, setdiff(colnames(H), free_renames)]
+
+A <- rbind(
+  cbind(M, H),
+  cbind(t(H), matrix(0, ncol(H), ncol(H)))
+)
+
+a_dex <- seq_len(nrow(H))
+A_inv <- solve(A)
+A_inv[-a_dex, -a_dex] <- -A_inv[-a_dex, -a_dex]
+A_inv <- normat(A_inv)
+
+plot_correlations(-A_inv[free_renames, -a_dex][, unlist(clusters[c(2, 4)])], sort = FALSE) +  xlab("Constraint") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+
+```{r}
+samp_copla <- samp_mats$info$copla
+
+copla_renames <- str_replace_all(colnames(samp_copla), "~~", "↔") %>%
+  str_replace_all("=~", "→") %>%
+  str_replace_all("(.*)~(.*)", "\\2→\\1")
+dimnames(samp_copla) <- rerun(2, copla_renames)
+```
+
+
+```{r}
+C <- vcov(samp_fit)[free_clust, free_clust]*nobs(samp_fit)
+dimnames(C) <- rerun(2, free_renames)
+o <- map_dbl(samp_free, ~ which(.x == free_clust))
+
+free_group <- map(clusters, ~ samp_copla[.x, .x]) %>%
+  map(MASS::ginv) %>%
+  map2(clusters, ., ~ C %*% samp_copla[free_renames, .x] %*% .y %*% samp_copla[.x, free_renames] %*% C) %>%
+  map(diag) %>%
+  do.call(what = cbind) %>%
+  sweep(1, diag(C), "/")
+
+plot_correlations(free_group[o, ], normalize = FALSE, sort = FALSE, text = FALSE) +
+  geom_vline(xintercept = seq_along(clusters)[-length(clusters)] + 0.5, size = 1, linetype = "dashed") +
+  xlab("Cluster")
+```
+
+
+## Moments clusters
+
+Creating the moment information matrix corresponding to the constrained dimensions of the model.
+
+```{r}
+mom_free <- samp_mats$names$free
+W <- samp_mats$W
+jac <- samp_mats$jac
+C <- solve(samp_mats$info$full[mom_free, mom_free])
+U2 <- W - W %*% jac[, mom_free] %*% C %*% crossprod(jac[, mom_free], W)
+u_mask <- diag(U2) > sqrt(.Machine$double.eps)
+U2_std <- cov2cor(U2[u_mask, u_mask])
+```
+
+
+Ordering by the clustering function to see if there are any identifiable clusters.
+
+```{r}
+u_ordering <- unlist(pseudo_frobenius(U2_std, as.list(colnames(U2_std)))[[1]])
+plot_correlations(U2_std[u_ordering, u_ordering], sort = FALSE)
+```
+
+
+There are no separable moment clusters for this model.
+
+
+## Discussion
+
+In another version of this example, the true model had missing paths from X1 to X3 and X4. With these included, the X3~~X4 cluster was showing some residual, despite being ORTHOGONAL to the X3~~X1 and X4~~X1 clusters and not being misspecified itself. Notably, by decreasing the error by decreasing the size of the path coefficients, the magnitude of the spillover into the X3~~X4 cluster diminished. Thus, we can conclude this spillover was clearly due to the 2nd-order approximation being unable to represent the non-independence of these constraints with non-orthogonality.
+
+This is a major, but necessarily acceptable, limitation of the use of 2nd-order approximation. When the residual is large, we need to be careful about the conclusions we draw. It also is a justification for drawing conclusions on only a few of the most justifiable constraints and refitting before continuing onto to evaluate the other constraints.
+
+
