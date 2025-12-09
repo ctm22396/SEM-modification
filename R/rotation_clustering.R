@@ -110,9 +110,10 @@ cut_cluster <- function(out, n_clusts) {
   
   if (weighting) {
     # weighted_clust_ind <- clust_ind %*% sqrt(solve(crossprod(clust_ind)))
-    Rsq_clust <- scale(R_final^2, center = centering, scale = FALSE) %*% clust_ind
-    weight_matrix <- diag(1 / sqrt(colSums(Rsq_clust^2)))
-    weighted_clust_ind <- clust_ind %*% weight_matrix
+    # Rsq_clust <- scale(R_final^2, center = centering, scale = FALSE) %*% clust_ind
+    # weight_matrix <- diag(1 / sqrt(colSums(Rsq_clust^2)))
+    # weighted_clust_ind <- clust_ind %*% weight_matrix
+    weighted_clust_ind <- clust_ind
   } else {
     weighted_clust_ind <- clust_ind
   }
@@ -253,7 +254,7 @@ clustered_varimax <- function(x, I = diag(ncol(x)), centering = FALSE, normalize
   
   p <- nrow(x)
   TT <- diag(nc)
-  II <- tcrossprod(tcrossprod(I) %*% MASS::ginv(tcrossprod(I)))
+  II <- tcrossprod(II) # tcrossprod(sqrt(pmax(tcrossprod(I) %*% MASS::ginv(tcrossprod(I)), 0))) # ends up being equivalent
   if (centering) {
     H <- diag(p) - matrix(1/p, p, p)
   } else {
@@ -552,7 +553,7 @@ hierarchical_MaxVar_clustering_SimpRot <- function(L, rotation = TRUE,
     if (rotation) {
       R <- clustered_varimax(R, clust_ind, centering = TRUE)$loadings
     }
-    # no more weighting because weigthing depends on R before rotation
+    # no more weighting because weighting depends on R before rotation
     R_sum <- R^2 %*% clust_ind
     
     if (centering) {
@@ -981,7 +982,7 @@ A <- bitransitive_closure(R2^2 > 0.023) # works for clusters_full
 # out <- hierarchical_MaxVar_clustering_avgMax(R, centering = FALSE, rotation = TRUE)
 out <- hierarchical_MaxVar_clustering_SimpRot(R, rotation = TRUE, centering = FALSE, weighting = TRUE)
 plot(out, hang = -1)
-res <- cut_cluster(out, 10)
+res <- cut_cluster(out, 12)
 res$clust_members[res$order]
 plot_correlations_clustered(abs(mat), res$clust_members[res$order])
 # map2(res$clust_members, res$clusters, \(x, y) res$R_final[x, y, drop = FALSE])[orig_order] %>%
