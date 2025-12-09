@@ -253,12 +253,12 @@ clustered_varimax <- function(x, I = diag(ncol(x)), centering = FALSE, normalize
   
   p <- nrow(x)
   TT <- diag(nc)
+  II <- tcrossprod(tcrossprod(I) %*% MASS::ginv(tcrossprod(I)))
   if (centering) {
     H <- diag(p) - matrix(1/p, p, p)
   } else {
     H <- diag(p)
   }
-  II <- tcrossprod(I)
   d <- 0
   for (i in 1L:1000L) {
     z <- x %*% TT
@@ -539,18 +539,18 @@ hierarchical_MaxVar_clustering_SimpRot <- function(L, rotation = TRUE,
   corFnorm_crit <- numeric(k)
   min_diag_crit <- numeric(k - 1)
   for (i in -(clust_dex[-1] + 1)) {
-    if (weighting) {
-      # weighted_clust_ind <- clust_ind %*% sqrt(solve(crossprod(clust_ind)))
-      # Rsq_clust <- scale(R^2, center = centering, scale = FALSE) %*% clust_ind
-      # weight_matrix <- diag(1 / sqrt(colSums(Rsq_clust^2)))
-      # weighted_clust_ind <- clust_ind %*% weight_matrix
-      weighted_clust_ind <- clust_ind
-    } else {
-      weighted_clust_ind <- clust_ind
-    }
+    # if (weighting) {
+    #   # weighted_clust_ind <- clust_ind %*% sqrt(solve(crossprod(clust_ind)))
+    #   # Rsq_clust <- scale(R^2, center = TRUE, scale = FALSE) %*% clust_ind
+    #   # weight_matrix <- diag(1 / sqrt(colSums(Rsq_clust^2)))
+    #   # weighted_clust_ind <- clust_ind %*% weight_matrix
+    #   weighted_clust_ind <- clust_ind
+    # } else {
+    #   weighted_clust_ind <- clust_ind
+    # }
     
     if (rotation) {
-      R <- clustered_varimax(R, weighted_clust_ind, centering = centering)$loadings
+      R <- clustered_varimax(R, clust_ind, centering = TRUE)$loadings
     }
     # no more weighting because weigthing depends on R before rotation
     R_sum <- R^2 %*% clust_ind
@@ -560,6 +560,8 @@ hierarchical_MaxVar_clustering_SimpRot <- function(L, rotation = TRUE,
       # kappa <- (q - 1)/(p + q - 2)
       # cov_mat <- crossprod(R_sum) - kappa * tcrossprod(colMeans(R_sum)) * p
       cov_mat <- cov(R_sum) * bias
+      # R_weight <- t(t(R_sum) - colMeans(R_sum) / colSums(clust_ind))
+      # cov_mat <- crossprod(R_weight) / p
     } else {
       cov_mat <- crossprod(R_sum) / p
     }
@@ -757,14 +759,32 @@ hierarchical_MaxVar_clustering_avgMax <- function(L, centering = FALSE, rotation
   corFnorm_crit <- numeric(k)
   min_diag_crit <- numeric(k - 1)
   for (i in -(clust_dex[-1] + 1)) {
-    C <- apply(R^2 %*% clust_ind, 1, \(x) x >= max(x)) %>% t()
-    if (rotation) {
+    # Ensure each cluster has variable associated with it.
+    # Eventually capture any that exceed 0.5 (unique association for rows)
+    # C <- apply(R^2 %*% clust_ind, 2, \(x) x >= max(x)) | (R^2 %*% clust_ind > 0.5)
+    # Alternatively, only rotate when unique association achieved for all rows
+    C <- (R^2 %*% clust_ind) > 0.5
+    if (rotation & all(rowSums(C) > 0)) {
       R <- avg_projmax(R, C, clust_ind, centering = centering)$loadings
+      
+      # Rotate within clusters based of C and clust_ind
+      # mask <- tcrossprod(C, clust_ind)
+      # R <- R %*% clustered_varimax(R * mask, centering = FALSE, normalize = TRUE, eps = eps)$rotmat
     }
     R_sum <- R^2 %*% clust_ind
     
     if (centering) {
+      # q <- ncol(clust_ind)
+      # # kappa <- 1 / p # varimax
+      # kappa <- q / (q + p - 2) # parsimax
+      # # kappa <- q / p / 2 # equamax
+      # R_kappa <- t(t(R_sum) - kappa * colMeans(R_sum)) -
+      #   (1 - kappa) * rowSums(R_sum) / k +
+      #   kappa * (1 - kappa) * mean(R_sum)
+      # cov_mat <- crossprod(R_kappa) / p
       cov_mat <- cov(R_sum) * bias
+      # R_weight <- t(t(R_sum) - colMeans(R_sum) / colSums(clust_ind))
+      # cov_mat <- crossprod(R_weight) / p
     } else {
       cov_mat <- crossprod(R_sum) / p
     }
@@ -935,7 +955,14 @@ bdd <- function(x, cluster_members) {
   list(R = R_BD2, rotmat = Q1 %*% Q2, clust_ind = I2)
 }
 
+
+# Sandbox -----------------------------------------------------------------
+
+# mat <- cov2cor(read_rds("./data/JAMO_cov_mat.rds")) # WORKS WAY BETTER WITH CENTERING
+
 # TODO: WHY CENTERING SO WEIRD FOR SAMP_SELECT
+
+
 samp_mats <- read_rds("./data/lvShipley_writeup_samp_mats.rds")
 samp_ortho_std <- samp_mats$samp_ortho_std
 a <- unlist(samp_mats$clusters_full)
@@ -944,19 +971,33 @@ a <- unlist(samp_mats$clusters_full)
 # a <- -1
 # a <- colnames(samp_ortho_std)
 mat <- samp_ortho_std[a, a]
-mat <- cov2cor(read_rds("./data/JAMO_cov_mat.rds"))[-22, -22] # WORKS WAY BETTER WITH CENTERING
 L <- compute_basis(mat)
-R <- varimax(L, eps = eps)$loadings
+R <- clustered_varimax(L, eps = 0)$loadings
 
 L2 <- compute_basis(MASS::ginv(mat) + 0*mat)
 R2 <- varimax(L2, normalize = FALSE, eps = eps)$loadings
 A <- bitransitive_closure(R2^2 > 0.023) # works for clusters_full
 
-out <- hierarchical_MaxVar_clustering_avgMax(t(as_unit_vec(t(R2))), centering = TRUE, rotation = TRUE)
-# out <- hierarchical_MaxVar_clustering_SimpRot(mat %*% R2, rotation = TRUE, centering = FALSE, weighting = FALSE)
-plot(out)
-res <- cut_cluster(out, 5)
+# out <- hierarchical_MaxVar_clustering_avgMax(R, centering = FALSE, rotation = TRUE)
+out <- hierarchical_MaxVar_clustering_SimpRot(R, rotation = TRUE, centering = FALSE, weighting = TRUE)
+plot(out, hang = -1)
+res <- cut_cluster(out, 10)
 res$clust_members[res$order]
 plot_correlations_clustered(abs(mat), res$clust_members[res$order])
 # map2(res$clust_members, res$clusters, \(x, y) res$R_final[x, y, drop = FALSE])[orig_order] %>%
 #   map(tcrossprod) %>% map(\(x) x^2) %>% map(plot_correlations)
+
+# test that mutually disjoint
+map(seq_along(res$clust_members), \(i) unlist(res$clust_members[-i])) %>%
+  map2(res$clust_members, intersect) %>%
+  unlist()
+
+resid_proj <- samp_ortho_std[1, a] %*% MASS::ginv(mat) %*% res$R_final
+R_full <- rbind(resids = as.vector(resid_proj), res$R_final)
+
+1 - pbeta(resid_proj^2 %*% res$clust_ind, colSums(res$clust_ind)/2, (ncol(R) - colSums(res$clust_ind))/2)[res$order]
+
+# sig clusters when a = -1; avgMax no centering; n_clusts = 10
+# maps to alph/eps and gam/delt
+# I guess kinda stinks bc missing beta/delt
+res$clust_members[res$order][c(2, 10)] 
