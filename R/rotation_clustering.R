@@ -254,7 +254,7 @@ clustered_varimax <- function(x, I = diag(ncol(x)), centering = FALSE, normalize
   
   p <- nrow(x)
   TT <- diag(nc)
-  II <- tcrossprod(II) # tcrossprod(sqrt(pmax(tcrossprod(I) %*% MASS::ginv(tcrossprod(I)), 0))) # ends up being equivalent
+  II <- tcrossprod(I) # tcrossprod(sqrt(pmax(tcrossprod(I) %*% MASS::ginv(tcrossprod(I)), 0))) # ends up being equivalent
   if (centering) {
     H <- diag(p) - matrix(1/p, p, p)
   } else {
@@ -967,7 +967,7 @@ bdd <- function(x, cluster_members) {
 samp_mats <- read_rds("./data/lvShipley_writeup_samp_mats.rds")
 samp_ortho_std <- samp_mats$samp_ortho_std
 a <- unlist(samp_mats$clusters_full)
-# a <- samp_mats$samp_select
+a <- samp_mats$samp_select
 # a <- samp_mats$samp_select[-c(15:17, 19, 20, 21, 23, 26, 27)]
 # a <- -1
 # a <- colnames(samp_ortho_std)
