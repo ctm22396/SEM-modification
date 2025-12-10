@@ -2,6 +2,8 @@
 #           (2008). An SVD approach to identifying metastable states of Markov
 #           chains. Electronic Transactions on Numerical Analysis. 29. 46-69. 
 # LINK TO PDF: https://opus4.kobv.de/opus4-matheon/frontdoor/deliver/index/docId/375/file/4034_meta_preprint.pdf
+# IDK IT DOESN'T WORK WITH SAMP_SELECT
+
 
 # helper functions
 rotate_by_block <- function(R, blocks) {
@@ -53,7 +55,7 @@ v_prod <- function(x, sk, sl, v = rep_along(c(sk, sl), 1)) {
 
 block_ident_step <- function(x, dex = seq_len(ncol(x)), v = rep(1, ncol(x)), thresh = 0.5) {
   # compute second left singular vector
-  singular2 <- svd(x)$u[, 2]
+  singular2 <- eigen(x, symmetric = FALSE)$vectors[, 2]
   
   # sort the vector and permute B index
   perm <- order(singular2)
@@ -80,10 +82,10 @@ block_ident_step <- function(x, dex = seq_len(ncol(x)), v = rep(1, ncol(x)), thr
   list(dex = split_dex, norm = diag_norms)
 }
 
-# R_init <- clustered_varimax(L, centering = FALSE, eps = eps)$loadings
+R_init <- clustered_varimax(L, centering = FALSE, eps = eps)$loadings
 # U <- L %*% project_onto_Stiefel(crossprod(L, MASS::ginv(mat))) # Not really sure how to think about this method... but it works
 # R_init <- U
-# R <- R_init
+R <- R_init
 # Note the B's here are stochastic (rowSums = 1)
 B <- crossprod(R^2) / colSums(R^2) # Dimension-based clustering
 # B <- matpow(B, 3)
@@ -138,14 +140,14 @@ while (!all(skip_ind)) {
   
   # Rotate before splitting
   I <- map(blocks, \(dex) seq_len(ncol(R)) %in% dex) %>% do.call(what = cbind)
-  R <- clustered_varimax(R, I, centering = FALSE)$loadings
+  R <- clustered_varimax(R, I, centering = FALSE, eps = eps)$loadings
   R <- rotate_by_block(R, blocks)
   B <- crossprod(R^2) / colSums(R^2) # for dimension based clustering
   
   norms <- temp_norms
 }
 
-R <- clustered_varimax(R, I, centering = FALSE)$loadings
+R <- clustered_varimax(R, I, centering = FALSE, eps = eps)$loadings
 map(blocks, \(dex) rowSums(R[, dex, drop = FALSE]^2)) %>% do.call(what = cbind) %>% plot_correlations()
 
 R_sum <- map(blocks, \(x) rowSums(R[, x, drop = FALSE]^2)) %>% do.call(what = cbind)
